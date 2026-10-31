@@ -58,6 +58,12 @@
  * （与 golden 一致）；x=±0 保号。CPU 全值域仿真 210 万点（稠密 [-200,200]、
  * p/exp 溢出过渡区、对数均匀大幅值、次正规、特殊值；IEEE 与 FTZ 两种
  * 中间量行为）对照 fp64 golden 零违例；bf16 Cast 往返同套验证零违例。
+ *
+ * round-5：tiling 新增 granuleRem 字段（前 r 个核各多 1 个 granule，host 计算
+ * 下发），kernel 每核序言免去从 totalNum/blockFactor/GetBlockNum() 重推 r 的
+ * 一次 64 位整数除法与守卫分支——该推导是每次启动的串行开销，全部 shape
+ * 受益。整数路径改动，数值零变化；新旧划分等价性经 36 组 shape × 2 dtype
+ * 逐 span 比对验证（覆盖连续、无重叠、边界一致）。
  */
 
 #ifndef MISH_H
@@ -164,23 +170,14 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
     const int64_t tileBytesT = elemPerTile_ * static_cast<int64_t>(sizeof(T));
     const int64_t tileBytesS = elemPerTile_ * scratchWidth;
 
-    // 每核范围：512B granule base+r 推导（分支条件仅元素总数/核数/粒度）。
-    // host 保证 blockLength_*numBlocks ≤ ⌈total/granule⌉*granule，剩余不足
-    // 一个 granule 的余量记为 r；last granule 夹到张量真实末尾。
+    // 每核范围：512B granule base+r 划分（round-5：r 由 host 经 tiling 字段直接
+    // 下发，恒满足 0 <= r < numBlocks，免去除法与 GetBlockNum 依赖）。
+    // last granule 夹到张量真实末尾。
     const int64_t blkIdx = static_cast<int64_t>(GetBlockIdx());
     const int64_t elemsPerGranule = GRANULE_BYTES / static_cast<int64_t>(sizeof(T));
-    const int64_t numBlocks = static_cast<int64_t>(GetBlockNum());
-    int64_t blockStart = 0;
-    currentBlockLength_ = 0;
-    {
-        int64_t covered = 0;
-        if (numBlocks > 0) covered = blockLength_ * numBlocks;  // 守卫分支：GetBlockNum 运行时防御
-        const int64_t leftover = totalLength_ - covered;
-        int64_t r = (leftover > 0) ? (leftover + elemsPerGranule - 1) / elemsPerGranule : 0;
-        if (r > numBlocks) r = numBlocks;
-        blockStart = blkIdx * blockLength_ + (blkIdx < r ? blkIdx : r) * elemsPerGranule;
-        currentBlockLength_ = blockLength_ + (blkIdx < r ? elemsPerGranule : 0);
-    }
+    const int64_t r = tilingData->granuleRem;
+    int64_t blockStart = blkIdx * blockLength_ + (blkIdx < r ? blkIdx : r) * elemsPerGranule;
+    currentBlockLength_ = blockLength_ + (blkIdx < r ? elemsPerGranule : 0);
     if (blockStart >= totalLength_) {
         blockStart = totalLength_;
         currentBlockLength_ = 0;

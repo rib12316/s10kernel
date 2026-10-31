@@ -138,16 +138,20 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
     if (numBlocks <= 0) {
         numBlocks = 1;   // totalNum == 0 仍下发 1 个空转核（守卫分支，运行时防御）
     }
-    // 512B 粒度均匀划分：blockFactor 字段承载均匀基长；前 r 核各多 1 个 granule，
-    // r 由 kernel 端从 totalNum 与 GetBlockNum() 重组。所有核起始 512B 对齐、
-    // 核间差 ≤1 granule。
+    // 512B 粒度均匀划分：blockFactor 字段承载均匀基长；前 r 核各多 1 个 granule。
+    // round-5：r 由 host 计算后经 tiling 字段直接下发（r = unitTotal - base*numBlocks，
+    // 恒满足 0 <= r < numBlocks），kernel 免去从 totalNum 重推 r 的一次 64 位整数
+    // 除法（每次启动每核都要执行的串行序言）。所有核起始 512B 对齐、核间差 ≤1 granule。
     const int64_t elemsPerGranule = GRANULE_BYTES / dtypeWidth;
     const int64_t unitTotal = CeilDiv(totalNum, elemsPerGranule);
-    const int64_t blockFactor = (unitTotal / numBlocks) * elemsPerGranule;
+    const int64_t baseUnits = unitTotal / numBlocks;
+    const int64_t blockFactor = baseUnits * elemsPerGranule;
+    const int64_t granuleRem = unitTotal - baseUnits * numBlocks;
 
     tiling->totalNum = totalNum;
     tiling->blockFactor = blockFactor;
     tiling->ubFactor = tileElems;
+    tiling->granuleRem = granuleRem;
 
     context->SetBlockDim(numBlocks);
     context->SetTilingKey(tilingKey);
