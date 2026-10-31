@@ -64,6 +64,13 @@
  * 一次 64 位整数除法与守卫分支——该推导是每次启动的串行开销，全部 shape
  * 受益。整数路径改动，数值零变化；新旧划分等价性经 36 组 shape × 2 dtype
  * 逐 span 比对验证（覆盖连续、无重叠、边界一致）。
+ *
+ * round-6：单 tile 核（currentBlockLength <= elemPerTile，可见小 shape 全部
+ * 命中）以比较直判 tileNum/tail/tiles 与 singleTile 标志，免去序言剩下的
+ * 最后一次 64 位整数除法；仅多 tile 核（大 shape，除法开销占比可忽略）保留
+ * 除法推导。单 tile 分支的 tileNum/tail 内部表示差异不被下游消费
+ * （SingleTileProcess 仅使用 currentBlockLength_），等价性含边界
+ * （length==elemPerTile、length==0）逐例验证。
  */
 
 #ifndef MISH_H
@@ -185,13 +192,23 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
         currentBlockLength_ = totalLength_ - blockStart;
     }
 
-    tileNum_ = currentBlockLength_ / elemPerTile_;
-    tailTileElementNum_ = currentBlockLength_ - tileNum_ * elemPerTile_;
-    tiles_ = tileNum_ + (tailTileElementNum_ > 0 ? 1 : 0);
-    // 单 tile 核（元素总数不超过单 tile 容量的运行时推导）走轻量路径：
-    // 每方向单缓冲、显式 pipe 事件同步、无队列状态机；空张量（tiles==0）
-    // 落回守卫返回。分支条件由 totalNum 与 tile 容量推导，非 shape 枚举。
-    singleTile_ = (tiles_ == 1 && currentBlockLength_ > 0);
+    // round-6：单 tile 核以比较直判（免去 64 位整数除法，小 shape 主路径）；
+    // 仅多 tile 核保留除法推导。单 tile 分支的 tileNum/tail 表示差异不被
+    // 下游消费（SingleTileProcess 仅使用 currentBlockLength_）。
+    singleTile_ = (currentBlockLength_ > 0) && (currentBlockLength_ <= elemPerTile_);
+    if (singleTile_) {
+        tileNum_ = 0;
+        tailTileElementNum_ = currentBlockLength_;
+        tiles_ = 1;
+    } else if (currentBlockLength_ > 0) {
+        tileNum_ = currentBlockLength_ / elemPerTile_;
+        tailTileElementNum_ = currentBlockLength_ - tileNum_ * elemPerTile_;
+        tiles_ = tileNum_ + (tailTileElementNum_ > 0 ? 1 : 0);
+    } else {
+        tileNum_ = 0;
+        tailTileElementNum_ = 0;
+        tiles_ = 0;  // 空张量守卫（tiles==0 时 Process 直接返回）
+    }
 
     if (singleTile_) {
         pipe.InitBuffer(bufIn, tileBytesT);
