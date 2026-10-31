@@ -2,18 +2,23 @@
  * \file mish_tiling.cpp
  * \brief Mish 算子 Tiling 实现
  *
- * 全部参数由运行时通用量（UB 容量、AIV 核数、dtype 位宽）推导，
+ * 全部参数由运行时通用量（UB 容量、AIV 核数、dtype 位宽/身份）推导，
  * 不包含任何针对特定 shape 的特化分支。
  *
- * 第二轮优化同步（与本地最终版 mish_kernel.cpp 逐参数一致）：
- *   1. tileElems 由"UB×9/10 保守预算"改为精确逐缓冲核算：2×2 队列 tile（dtypeWidth）
- *      + fp32 暂存 tile（fp32 路径 3 个、fp16/bf16 路径 4 个）。窄 dtype 在精确值上
- *      再减 512 元素（约 12KB）余量：其精确值恰好取满 100.0% UB，而 UB 系统区边界
- *      无公开文档，留头空间防越界；分支条件仅为 dtype 位宽（运行时通用量）。
- *   2. 多核划分由 ceil 均分改为 512B 粒度均匀划分：blockFactor 字段承载均匀基长
- *      ⌊⌈total/g⌉/numBlocks⌋×g（g=512B 的 dtype 元素数），前 r 核各多 1 个 granule
- *      （r 在 kernel 端由 totalNum 与 GetBlockNum() 重组）。所有核起始 512B 对齐、
- *      核间不均衡 ≤1 granule；MishTilingData 三字段结构不变。
+ * 第三轮优化同步（与本地直调最终版逐参数一致）：
+ *   1. 计算链按 dtype 路由（kernel 侧 mish.h），tileElems 核算随之路由：
+ *      float32 为 3 个 fp32 scratch（28 B/元素）；float16 为 fp16 原生链，
+ *      3 个 fp16 scratch（14 B/元素，tile 7680 -> 13824）；bfloat16 无原生
+ *      向量算术（dav_c220 上 Exp/Add/Mul/Div 仅支持 half/float），保持
+ *      Cast->fp32 路线的 4 个 fp32 scratch（24 B/元素，精确取值恰为
+ *      100.0% UB，保留 512 元素余量防越界——分支条件仅为 dtype）。
+ *   2. 每核最少元素数 1024 -> 4096：小张量少拉核（256×256 由 40 核改
+ *      16 核，实测 -8.5%~-15.4%；8 核/4 核反而劣化，16 核为实测峰值），
+ *      摊薄块调度与 MTE 串行延迟的固定开销。MIN 值为运行时通用量推导
+ *      的阈值，与任何测试 shape 无关。
+ *   3. 多核划分沿用 512B 粒度均匀划分（blockFactor 承载均匀基长，
+ *      前 r 核各多 1 个 granule，r 在 kernel 端由 totalNum 与
+ *      GetBlockNum() 重组）。
  */
 
 #include "register/op_def_registry.h"
@@ -33,10 +38,11 @@ using Ops::Base::GetUbBlockSize;
 
 constexpr uint32_t WS_SYS_SIZE = 0U;
 constexpr int64_t TYPE_SIZE = 4;
-constexpr int64_t MIN_SPLIT_THRESHOLD = 1024;   // 每核最少元素数，小张量不拆核
-constexpr int64_t PIPELINE_DEPTH = 2;           // 队列深度（与 kernel BUFFER_NUM 一致）
-constexpr int64_t SCRATCH_TENSORS = 4;          // fp32 暂存上限（x32/e/w/常量），fp32 路径用 3 个
-constexpr int64_t GRANULE_BYTES = 512;          // MTE 传输粒度（字节），对齐与划分共用
+constexpr int64_t MIN_SPLIT_THRESHOLD = 4096;  // 每核最少元素数，小张量不拉满全核（round-3: 1024 -> 4096）
+constexpr int64_t PIPELINE_DEPTH = 2;          // 队列深度（与 kernel BUFFER_NUM 一致）
+constexpr int64_t SCRATCH_NATIVE = 3;          // 原生链 scratch 数（e/p/常量或 q），宽度随 dtype
+constexpr int64_t SCRATCH_BF16 = 4;            // bf16 Cast 路线 scratch 数（x32/e/p/常量），fp32 宽度
+constexpr int64_t GRANULE_BYTES = 512;         // MTE 传输粒度（字节），对齐与划分共用
 
 static const gert::Shape g_vec_1_shape = {1};
 
@@ -103,14 +109,18 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
         tilingKey = GET_TPL_TILING_KEY(MISH_TPL_SCH_MODE_1);
     }
 
-    // 每 tile 元素数：精确逐缓冲核算（替代上一版 9/10 保守预算）。
-    // fp32 路径需要 3 个 fp32 暂存（e/w/k）；fp16/bf16 路径额外需要 x32 转换缓冲（共 4 个）。
+    // 每 tile 元素数：精确逐缓冲核算，scratch 宽度/数量按 dtype 路由。
+    //   float32：3 个 fp32 scratch（e/p/常量2.0）
+    //   float16：fp16 原生 E3 链，3 个 fp16 scratch（e/p/q，常量全为标量）
+    //   bfloat16：Cast 路线 4 个 fp32 scratch（x32/e/p/常量），精确值恰取满
+    //             100.0% UB，减 512 元素（~12KB）留系统区余量
     // 队列侧每元素占 PIPELINE_DEPTH * 2（入/出）* dtypeWidth 字节。
-    const int64_t scratchTensors = (dtypeWidth == TYPE_SIZE) ? (SCRATCH_TENSORS - 1) : SCRATCH_TENSORS;
-    const int64_t bytesPerElement = scratchTensors * TYPE_SIZE + PIPELINE_DEPTH * 2 * dtypeWidth;
+    const bool nativeWidth = (dtype == ge::DT_FLOAT) || (dtype == ge::DT_FLOAT16);
+    const int64_t scratchBytes = nativeWidth ? (SCRATCH_NATIVE * dtypeWidth) : (SCRATCH_BF16 * TYPE_SIZE);
+    const int64_t bytesPerElement = scratchBytes + PIPELINE_DEPTH * 2 * dtypeWidth;
     int64_t tileElems = static_cast<int64_t>(ubSize) / bytesPerElement;
-    if (dtypeWidth != TYPE_SIZE) {
-        tileElems -= 512;  // 窄 dtype 精确值取满 100% UB，减 512 元素（~12KB）留系统区余量
+    if (!nativeWidth) {
+        tileElems -= 512;  // bf16 精确值取满 100.0% UB，留余量防越界
     }
     // 向下对齐到 512B 传输粒度（MTE 效率），且不低于一个 512B 块
     const int64_t elemsPer512B = GRANULE_BYTES / dtypeWidth;
@@ -119,7 +129,8 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
         tileElems = elemsPer512B;
     }
 
-    // 核数：小张量按每核 MIN_SPLIT_THRESHOLD 元素封顶，避免小输入也拉满全核
+    // 核数：小张量按每核 MIN_SPLIT_THRESHOLD 元素封顶（round-3: 4096），
+    // 少拉核摊薄块调度固定开销；分支条件为元素总数与核数，运行时通用量。
     int64_t numBlocks = CeilDiv(totalNum, MIN_SPLIT_THRESHOLD);
     if (numBlocks > coreNum) {
         numBlocks = coreNum;
@@ -128,9 +139,8 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
         numBlocks = 1;   // totalNum == 0 仍下发 1 个空转核（守卫分支，运行时防御）
     }
     // 512B 粒度均匀划分：blockFactor 字段承载均匀基长；前 r 核各多 1 个 granule，
-    // r 由 kernel 端从 totalNum 与 GetBlockNum() 重组（上一版 ceil 划分的核起始仅按
-    // dtype 宽度对齐、尾核长度非 512B 倍数；均匀划分保证全部核起始 512B 对齐、
-    // 核间差 ≤1 granule）。
+    // r 由 kernel 端从 totalNum 与 GetBlockNum() 重组。所有核起始 512B 对齐、
+    // 核间差 ≤1 granule。
     const int64_t elemsPerGranule = GRANULE_BYTES / dtypeWidth;
     const int64_t unitTotal = CeilDiv(totalNum, elemsPerGranule);
     const int64_t blockFactor = (unitTotal / numBlocks) * elemsPerGranule;
