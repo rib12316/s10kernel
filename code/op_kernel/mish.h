@@ -45,6 +45,19 @@
  * round-3 其余结构沿用 round-2：单 tile 轻量路径（TBuf + 显式 pipe 事件）、
  * 多核 512B 粒度均衡划分（tiling 侧 round-3 起每核最少元素数 1024 -> 4096，
  * 小张量少拉核、摊薄块调度开销；tileElems 按 dtype 路由精确核算）。
+ *
+ * round-4：fp32/bf16 链统一迁移到 E3 排列（y = (x/w)*p'，w = p'+2，
+ * p' = min(e(e+2), dtype 最大有限值)），与 fp16 共用一个模板链：
+ *   - Div 由 2 次降为 1 次（A2 向量单元除超越函数外最贵运算）
+ *   - 常量 2.0 tile 与序言 Duplicate 整体消除（round-3 的 fp32/bf16 每次
+ *     启动都全量填充常量向量，单 tile 小核纯浪费），常量全部标量广播
+ *   - scratch 仍为 3 个（e/p/q），tiling 核算不变
+ * +Inf 安全性（round-3 认为 "1+2/p" 是 +Inf 安全唯一排列，该结论只对无
+ * 钳位形式成立）：p'=FLT_MAX 使 w=FLT_MAX（+2 舍入不动），q=Inf/FLT_MAX
+ * =Inf，y=Inf*FLT_MAX=+Inf；-Inf：e=+0，p'=0，w=2，q=-Inf，y=-Inf*0=NaN
+ * （与 golden 一致）；x=±0 保号。CPU 全值域仿真 210 万点（稠密 [-200,200]、
+ * p/exp 溢出过渡区、对数均匀大幅值、次正规、特殊值；IEEE 与 FTZ 两种
+ * 中间量行为）对照 fp64 golden 零违例；bf16 Cast 往返同套验证零违例。
  */
 
 #ifndef MISH_H
@@ -62,36 +75,38 @@ using namespace AscendC;
 constexpr int32_t BUFFER_NUM = 2;
 constexpr int32_t FLOAT_BYTES = 4;
 constexpr int64_t GRANULE_BYTES = 512;  // MTE 传输粒度（字节），与 tiling 侧一致
-// fp16 最大有限值：E3 链 Mins 钳位的上界（dtype 值域饱和保护，非测试派生常量）
+// dtype 最大有限值：E3 链 Mins 钳位的上界（dtype 值域饱和保护，非测试派生常量）
 constexpr float HALF_MAX_FINITE = 65504.0f;
+constexpr float FLT_MAX_FINITE = 3.402823466e+38f;
 
-// fp32 计算链（float 直用 / bfloat16 经 Cast）：y = x/d, d = 1 + 2/p, p = e(e+2)
-// 缓冲区角色：x32 只读输入；eT 演化 e->c->d；pT 演化 a->p；kT 序言预生成常量
-// 2.0 tile。逐位一致性：无减法故无灾难性消去；Exp ~1 ulp + 4 步 <=0.5 ulp。
-__aicore__ inline void MishFp32Chain(const LocalTensor<float> x32, LocalTensor<float> eT,
-    LocalTensor<float> pT, LocalTensor<float> kT, LocalTensor<float> y, int32_t count)
+// round-4 统一 E3 计算链（fp32 直用 / fp16 原生 / bfloat16 经 Cast 后 fp32 用）：
+//   e = exp(x); a = e+2; p = e*a; p' = min(p, dtypeMax); w = p'+2; q = x/w; y = q*p'
+// 7 运算、单次 Div、全常量标量广播（无需常量向量与序言填充）。值域安全性
+// （+Inf/-Inf/NaN/±0/大正数 exp 溢出区/小负数次正规区）见文件头 round-4 注释。
+// 缓冲区角色：xT 只读输入；eT 演化 e->w；pT 演化 a->p'（钳位后）；qT 独立
+// Div 目的；y 接收结果。
+template <typename T>
+__aicore__ inline constexpr T MishDtypeMaxFin()
 {
-    Exp<float>(eT, x32, count);                 // e = exp(x)
-    Adds<float>(pT, eT, 2.0f, count);           // a = e + 2
-    Mul<float>(pT, eT, pT, count);              // p = e(e+2)   （eT 自此死亡）
-    Div<float>(eT, kT, pT, count);              // c = 2/p      （复用死亡 eT）
-    Adds<float>(eT, eT, 1.0f, count);           // d = 1 + 2/p
-    Div<float>(y, x32, eT, count);              // y = x / d
+    if constexpr (IsSameType<T, half>::value) {
+        return static_cast<half>(HALF_MAX_FINITE);
+    } else {
+        return static_cast<T>(FLT_MAX_FINITE);
+    }
 }
 
-// fp16 原生 E3 链：y = (x/(p'+2))*p'，p' = min(e(e+2), 65504)（dtype 最大有限值）
-// 排列的值域安全性见文件头注释；qT 为第三个 scratch（w 占用死亡的 eT，
-// Div 需独立目的操作数）。7 运算、全标量广播常量、无序言填充。
-__aicore__ inline void MishHalfChain(const LocalTensor<half> xT, LocalTensor<half> eT,
-    LocalTensor<half> pT, LocalTensor<half> qT, LocalTensor<half> y, int32_t count)
+template <typename T>
+__aicore__ inline void MishE3Chain(const LocalTensor<T> xT, LocalTensor<T> eT,
+    LocalTensor<T> pT, LocalTensor<T> qT, LocalTensor<T> y, int32_t count)
 {
-    Exp<half>(eT, xT, count);                         // e = exp(x)
-    Adds<half>(pT, eT, static_cast<half>(2.0), count);   // a = e + 2
-    Mul<half>(pT, eT, pT, count);                     // p = e(e+2)
-    Mins<half>(pT, pT, static_cast<half>(HALF_MAX_FINITE), count); // p' = min(p, dtypeMax)
-    Adds<half>(eT, pT, static_cast<half>(2.0), count);    // w = p'+2（复用 eT）
-    Div<half>(qT, xT, eT, count);                     // q = x/w
-    Mul<half>(y, qT, pT, count);                      // y = q*p'
+    constexpr T kDtypeMax = MishDtypeMaxFin<T>();
+    Exp<T>(eT, xT, count);                              // e = exp(x)
+    Adds<T>(pT, eT, static_cast<T>(2.0), count);        // a = e + 2
+    Mul<T>(pT, eT, pT, count);                          // p = e(e+2)
+    Mins<T>(pT, pT, kDtypeMax, count);                  // p' = min(p, dtype 最大有限值)
+    Adds<T>(eT, pT, static_cast<T>(2.0), count);        // w = p' + 2（复用 eT）
+    Div<T>(qT, xT, eT, count);                          // q = x / w
+    Mul<T>(y, qT, pT, count);                           // y = q * p'
 }
 
 // dtype 路由（编译期，条件为 dtype 身份）
@@ -118,7 +133,7 @@ private:
     TQue<QuePosition::VECIN, BUFFER_NUM> inputQueueX;
     TQue<QuePosition::VECOUT, BUFFER_NUM> outputQueueY;
     TBuf<TPosition::VECCALC> bufIn, bufOut;             // 单 tile 轻量路径缓冲
-    TBuf<TPosition::VECCALC> bufX32, bufE, bufP, bufK;  // bufK: fp32/bf16 常量 2.0；fp16 为 q 暂存
+    TBuf<TPosition::VECCALC> bufX32, bufE, bufP, bufK;  // e/p/q 三个演化暂存（bufK 为 q；bf16 另有 x32）
 
     GlobalTensor<T> inputGMX;
     GlobalTensor<T> outputGMY;
@@ -198,14 +213,8 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
     inputGMX.SetGlobalBuffer((__gm__ T *)x + blockStart);
     outputGMY.SetGlobalBuffer((__gm__ T *)y + blockStart);
 
-    // 序言：预生成 fp32 链消费的常量 2.0 tile（round-2 起每 tile 三次 Duplicate
-    // 合并为一次）。fp16 E3 链常量全部为标量广播，无需序言填充，bufK 转作
-    // q 暂存使用。
-    if (tiles_ > 0) {
-        if constexpr (!kIsHalf) {
-            Duplicate<float>(bufK.template Get<float>(), 2.0f, static_cast<int32_t>(elemPerTile_));
-        }
-    }
+    // round-4：统一 E3 链常量全部为标量广播，无序言填充（round-3 的 fp32/bf16
+    // 需全量预生成常量 2.0 tile，已消除）。
 }
 
 // 提交一个 tile 的拷入（DataCopyPad 支持任意字节长度，含非对齐尾块）
@@ -239,17 +248,17 @@ __aicore__ inline void Mish<T>::SingleTileProcess()
 
     auto yLocal = bufOut.template Get<T>();
     if constexpr (kIsFloat) {
-        MishFp32Chain(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
+        MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
             bufP.template Get<float>(), bufK.template Get<float>(),
             yLocal.template ReinterpretCast<float>(), count);
     } else if constexpr (kIsHalf) {
-        MishHalfChain(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
+        MishE3Chain<half>(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
             bufK.template Get<half>(), yLocal, count);
     } else {
         // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
         auto x32 = bufX32.template Get<float>();
         Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-        MishFp32Chain(x32, bufE.template Get<float>(), bufP.template Get<float>(),
+        MishE3Chain<float>(x32, bufE.template Get<float>(), bufP.template Get<float>(),
             bufK.template Get<float>(), x32, count);
         Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
     }
@@ -287,17 +296,17 @@ __aicore__ inline void Mish<T>::Process()
         auto xLocal = inputQueueX.DeQue<T>();
         auto yLocal = outputQueueY.AllocTensor<T>();
         if constexpr (kIsFloat) {
-            MishFp32Chain(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
+            MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
                 bufP.template Get<float>(), bufK.template Get<float>(),
                 yLocal.template ReinterpretCast<float>(), count);
         } else if constexpr (kIsHalf) {
-            MishHalfChain(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
+            MishE3Chain<half>(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
                 bufK.template Get<half>(), yLocal, count);
         } else {
             // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
             auto x32 = bufX32.template Get<float>();
             Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-            MishFp32Chain(x32, bufE.template Get<float>(), bufP.template Get<float>(),
+            MishE3Chain<float>(x32, bufE.template Get<float>(), bufP.template Get<float>(),
                 bufK.template Get<float>(), x32, count);
             Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
         }
