@@ -71,6 +71,45 @@
  * 除法推导。单 tile 分支的 tileNum/tail 内部表示差异不被下游消费
  * （SingleTileProcess 仅使用 currentBlockLength_），等价性含边界
  * （length==elemPerTile、length==0）逐例验证。
+ *
+ * round-7（workflow4 性能节点，2026-11-04；延迟分解显示 TPipe 多 TBuf 簿记
+ * ≈0.5~0.85μs，是小区间地板中可攻击部分。采纳 2 项，实测数字均为 2026-11-04
+ * 勘误后口径，与 workflow4 3-性能优化报告.md §9 及 优化报告.md §2 一致）：
+ *   - D3b 单 tile 轻量路径缓冲合一：x/y/scratch 并入单个 TBuf，且按实际
+ *     核内长度（各区域 512B 取整对齐）而非满 tile 尺寸分配——基线为 1024
+ *     元素负载分配 ~138 KiB/核，采纳后 ~16 KiB/核，该路径 InitBuffer 由
+ *     5~6 次降为 1 次。独立干净会话 A/B（perf-p3b-singletbuf vs 基线 4 会话
+ *     中位）：64×64 fp32 -0.19μs、128×128 fp32 +0.03（噪声级）、bf16 五点
+ *     4/5 改善（-0.11~-0.17）、fp16 五点 -0.10~+0.03（噪声级）——独立会话
+ *     自身信号以噪声级为主，采纳依据为组合增量证据（final(D3b+cap16) vs
+ *     cap16 单独版同协议直接对比：小区间 15 点中 12 点改善 -0.03~-0.12、
+ *     3 点 |Δ|<=0.02 噪声持平、0 点劣化；大 shape 10 点全部在基线同二进制
+ *     噪声带内）。
+ *   - 多 tile 路径 scratch 合一（D3）：e/p/q 演化暂存（bf16 另含 x32）由
+ *     3~4 个独立 TBuf 并为 1 个 TBuf 手工切片，槽位按元素偏移寻址
+ *     （ScratchSlot），队列侧不变；多 tile 核 InitBuffer 次数同步下降。
+ *   - D5 核数细粒度策略带封顶（host 侧 mish_tiling.cpp）：numBlocks =
+ *     min(ceil(total/2048), max(ceil(total/4096), 16))，仅 total<=65536
+ *     生效；total>65536 时表达式严格等于基线 ceil(total/4096)，大 shape
+ *     tiling 与 round-6 基线逐位相同（构造性不劣化）。
+ *   - 本轮证伪未采纳（勘误后区间）：②链调度双流交错（大 shape 10 点
+ *     -0.36~+13.08μs，其中 9/10 点 +0.10~+13.08 劣化、fp32 8192² 单点
+ *     -0.36 在基线同二进制极差带内）；④对齐主干 DataCopy 替代
+ *     DataCopyPad（小区间 15 点中 14 点 +0.01~+0.30 略负、1 点 -0.01
+ *     噪声级——dav_c220 上 pad 路径无固定开销可省）；⑥tiling 参数
+ *     32B->16B 压缩（直调标量传参形态小区间 14/15 点 +0.09~+0.54 劣化、
+ *     大 shape 最高 +5.00；该证伪仅针对直调启动形态，平台 GM-struct
+ *     形态不受其约束，但本轮证据不支持在该形态外做此改动）。
+ *   - 精度：D3b、cap16、final 组合各独立全量黑盒 61/61 PASS（官方 checker
+ *     三域判据，fp64 golden），特殊值（±Inf/NaN、-1.1924、次正规、±0 保号、
+ *     rank-0）逐例核验全过；阈值零改动，逐元素运算与 round-6 完全一致
+ *     （均为执行结构变化）。
+ *
+ * 本文件为平台 GM-struct 形态：与直调最终版（workflow4 direct-invoke
+ * mish_kernel.cpp，sha256 e6e477a8…）的类体逐行同源，仅 tiling 交付方式
+ * 不同——平台版经 GET_TILING_DATA_WITH_STRUCT 从 GM 读 MishTilingData
+ * 四字段（totalNum/blockFactor/ubFactor/granuleRem），直调版以同名标量
+ * 参数传入；host 侧 tiling 计算与直调 calc_mish_tiling_params 一一对应。
  */
 
 #ifndef MISH_H
@@ -140,13 +179,26 @@ public:
 private:
     __aicore__ inline void CopyInTile(int64_t tileIdx, int64_t tileElemNum);
     __aicore__ inline void SingleTileProcess();
+    // round-7 方向③：共享 scratch TBuf 的元素偏移视图（槽位步长 = 计算 dtype
+    // 的一个 tile；单 tile 路径槽位在 bufSingle 内按 singleTileStrideS_ 偏移）
+    template <typename CT>
+    __aicore__ inline AscendC::LocalTensor<CT> ScratchSlot(int32_t slot)
+    {
+        if (singleTile_) {
+            return bufSingle.template Get<CT>()[static_cast<uint32_t>(singleTileOffsetS_ + slot * singleTileStrideS_)];
+        }
+        return bufScratch.template Get<CT>()[static_cast<uint32_t>(slot) * static_cast<uint32_t>(elemPerTile_)];
+    }
 
 private:
     TPipe pipe;
     TQue<QuePosition::VECIN, BUFFER_NUM> inputQueueX;
     TQue<QuePosition::VECOUT, BUFFER_NUM> outputQueueY;
-    TBuf<TPosition::VECCALC> bufIn, bufOut;             // 单 tile 轻量路径缓冲
-    TBuf<TPosition::VECCALC> bufX32, bufE, bufP, bufK;  // e/p/q 三个演化暂存（bufK 为 q；bf16 另有 x32）
+    TBuf<TPosition::VECCALC> bufSingle;                 // round-7 D3b：单 tile 路径 x/y/scratch 单 TBuf 区域
+    TBuf<TPosition::VECCALC> bufScratch;                // round-7 D3：多 tile 路径 scratch 合一（1 次分配手工切片）
+    int64_t singleTileOffsetY_ = 0;                     // bufSingle 内 y 区域元素偏移
+    int64_t singleTileOffsetS_ = 0;                     // bufSingle 内 scratch 区域元素偏移
+    int64_t singleTileStrideS_ = 0;                     // scratch 槽位步长（CT 元素，512B 对齐）
 
     GlobalTensor<T> inputGMX;
     GlobalTensor<T> outputGMY;
@@ -166,9 +218,9 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
 {
     constexpr bool kIsHalf = MishIsHalf<T>();
     constexpr bool kIsFloat = (sizeof(T) == static_cast<size_t>(FLOAT_BYTES));
-    // scratch 宽度与数量按 dtype 路由：float 3×4B | half 3×2B | bfloat16 4×4B(x32)
+    // scratch 宽度与数量按 dtype 路由：float 3×4B | half 3×2B | bfloat16 4×4B(x32)。
+    // 每 tile 元素数的 UB 精确核算在 host 侧 mish_tiling.cpp 完成，kernel 只消费结果。
     constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
-    constexpr int64_t scratchCount = (kIsFloat || kIsHalf) ? 3 : 4;
 
     totalLength_ = tilingData->totalNum;
     // blockFactor 为 512B 粒度均匀基长（前 r 核各多 1 个 granule，r 在下方重组）
@@ -210,25 +262,33 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
         tiles_ = 0;  // 空张量守卫（tiles==0 时 Process 直接返回）
     }
 
+    // round-7 方向③：e/p/q 演化暂存（bfloat16 另含 x32）共用一次 TBuf 分配，
+    // 链内按下方元素偏移切片访问。单 tile 路径见 D3b，多 tile 路径 InitBuffer
+    // 次数由 5~6 降为 3（队列×2 + scratch×1），每次启动少一轮 TPipe 簿记。
+    constexpr int64_t SCRATCH_COUNT = (kIsFloat || kIsHalf) ? 3 : 4;
     if (singleTile_) {
-        pipe.InitBuffer(bufIn, tileBytesT);
-        pipe.InitBuffer(bufOut, tileBytesT);
+        // round-7 D3b：时延关键的单 tile 路径上 x/y/scratch 区域并入单个 TBuf，
+        // 且按实际核内长度（各区域 512B 向上取整对齐，故所有切片保持 granule
+        // 对齐）而非满 tile 尺寸分配。基线版本为 1024 元素负载按满 tile 分配
+        // ~138 KiB/核；按实际长度分配消除了差值，并把该路径收敛到恰好 1 次
+        // InitBuffer。region/regionS 偏移与槽位步长均为整除关系，分配总量
+        // 2*region + SCRATCH_COUNT*regionS 覆盖全部切片（布局检视见移植记录）。
+        int64_t region = currentBlockLength_ * static_cast<int64_t>(sizeof(T));
+        region = (region + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
+        int64_t regionS = currentBlockLength_ * scratchWidth;
+        regionS = (regionS + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
+        singleTileOffsetY_ = region / static_cast<int64_t>(sizeof(T));
+        singleTileOffsetS_ = (2 * region) / scratchWidth;
+        singleTileStrideS_ = regionS / scratchWidth;  // 512B 对齐的槽位步长
+        pipe.InitBuffer(bufSingle, 2 * region + SCRATCH_COUNT * regionS);
     } else {
         pipe.InitBuffer(inputQueueX, BUFFER_NUM, tileBytesT);
         pipe.InitBuffer(outputQueueY, BUFFER_NUM, tileBytesT);
+        pipe.InitBuffer(bufScratch, SCRATCH_COUNT * tileBytesS);
     }
-    if constexpr (!kIsFloat && !kIsHalf) {
-        pipe.InitBuffer(bufX32, tileBytesS);  // bfloat16 Cast 往返暂存
-    }
-    pipe.InitBuffer(bufE, tileBytesS);
-    pipe.InitBuffer(bufP, tileBytesS);
-    pipe.InitBuffer(bufK, tileBytesS);
 
     inputGMX.SetGlobalBuffer((__gm__ T *)x + blockStart);
     outputGMY.SetGlobalBuffer((__gm__ T *)y + blockStart);
-
-    // round-4：统一 E3 链常量全部为标量广播，无序言填充（round-3 的 fp32/bf16
-    // 需全量预生成常量 2.0 tile，已消除）。
 }
 
 // 提交一个 tile 的拷入（DataCopyPad 支持任意字节长度，含非对齐尾块）
@@ -255,25 +315,25 @@ __aicore__ inline void Mish<T>::SingleTileProcess()
     DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
     const int32_t evtMte2V = static_cast<int32_t>(pipe.FetchEventID(HardEvent::MTE2_V));
     const int32_t evtVMte3 = static_cast<int32_t>(pipe.FetchEventID(HardEvent::V_MTE3));
-    auto xLocal = bufIn.template Get<T>();
+    auto xLocal = bufSingle.template Get<T>();
     DataCopyPad(xLocal, inputGMX[0], copyParams, padParams);
     SetFlag<HardEvent::MTE2_V>(evtMte2V);
     WaitFlag<HardEvent::MTE2_V>(evtMte2V);
 
-    auto yLocal = bufOut.template Get<T>();
+    auto yLocal = bufSingle.template Get<T>()[static_cast<uint32_t>(singleTileOffsetY_)];
     if constexpr (kIsFloat) {
-        MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
-            bufP.template Get<float>(), bufK.template Get<float>(),
+        MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
+            ScratchSlot<float>(1), ScratchSlot<float>(2),
             yLocal.template ReinterpretCast<float>(), count);
     } else if constexpr (kIsHalf) {
-        MishE3Chain<half>(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
-            bufK.template Get<half>(), yLocal, count);
+        MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
+            ScratchSlot<half>(2), yLocal, count);
     } else {
         // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
-        auto x32 = bufX32.template Get<float>();
+        auto x32 = ScratchSlot<float>(0);
         Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-        MishE3Chain<float>(x32, bufE.template Get<float>(), bufP.template Get<float>(),
-            bufK.template Get<float>(), x32, count);
+        MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
+            ScratchSlot<float>(3), x32, count);
         Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
     }
     SetFlag<HardEvent::V_MTE3>(evtVMte3);
@@ -310,18 +370,18 @@ __aicore__ inline void Mish<T>::Process()
         auto xLocal = inputQueueX.DeQue<T>();
         auto yLocal = outputQueueY.AllocTensor<T>();
         if constexpr (kIsFloat) {
-            MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), bufE.template Get<float>(),
-                bufP.template Get<float>(), bufK.template Get<float>(),
+            MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
+                ScratchSlot<float>(1), ScratchSlot<float>(2),
                 yLocal.template ReinterpretCast<float>(), count);
         } else if constexpr (kIsHalf) {
-            MishE3Chain<half>(xLocal, bufE.template Get<half>(), bufP.template Get<half>(),
-                bufK.template Get<half>(), yLocal, count);
+            MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
+                ScratchSlot<half>(2), yLocal, count);
         } else {
             // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
-            auto x32 = bufX32.template Get<float>();
+            auto x32 = ScratchSlot<float>(0);
             Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-            MishE3Chain<float>(x32, bufE.template Get<float>(), bufP.template Get<float>(),
-                bufK.template Get<float>(), x32, count);
+            MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
+                ScratchSlot<float>(3), x32, count);
             Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
         }
         outputQueueY.EnQue<T>(yLocal);

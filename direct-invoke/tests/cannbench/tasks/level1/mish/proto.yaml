@@ -1,0 +1,40 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------
+# mish 任务包（workflow4 物化：冻结复用 /workspace/算子挑战赛/mish/tests/cannbench/tasks/level1/mish/
+# proto.yaml @ sha256 5355c60f38fc3baadda8e8adc6a1991674d0f0a5e5e099f718e41216edf58792）。
+# 相对源文件的唯一内容变更（$WORK_DIR/0.1-黑盒测试设计.md 第 8.2 节定稿，事实性同步）：
+#   shape_support 1D~8D → 0D~8D（0 维标量按 1 元素处理，依据 workflow4 R3 已确认规格，
+#   与官方归档 proto「输入0-8维」一致）。其余字段（operator/schema/dtype/attrs/精度口径）未动。
+# 格式范本：cann-bench@7266e52 tasks/level1/exp。
+# 不配置 precision_thresholds，走 thresholds.py 默认表（fp16 2^-10 / bf16 2^-7 / fp32 2^-13）。
+
+operator:
+  name: mish
+  category: Elementwise
+  difficulty: L1
+  formula: y = x * tanh(softplus(x))，softplus(x) = ln(1 + e^x)
+  description: 计算输入张量的 Mish 激活函数，对齐 PyTorch torch.nn.functional.mish
+  shape_support: 输入任意维度（0D~8D，0 维标量按 1 元素处理），输出与输入相同shape
+  attrs: []
+  inputs:
+  - name: x
+    description: 输入张量
+    dtype:
+    - float16
+    - float32
+    - bfloat16
+  outputs:
+  - name: y
+    description: Mish 激活结果，输出数据类型与输入一致
+    dtype:
+    - float16
+    - float32
+    - bfloat16
+  schema: mish(Tensor x) -> Tensor y

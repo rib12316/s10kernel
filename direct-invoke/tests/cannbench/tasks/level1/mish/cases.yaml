@@ -1,0 +1,616 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------
+# mish 用例集（workflow4 物化，共 61 例 = 黑盒 50 + 白盒 11）。
+# 冻结复用来源：/workspace/算子挑战赛/mish/tests/cannbench/tasks/level1/mish/cases.yaml
+# @ sha256 5832710fac556edb06bec1a1f3bca59c8d4d960121255dec579cd812494d107a
+# （workflow2 创建 41 黑盒；workflow3 扩展白盒 42~52 并复核 note，52/52 全量通过）。
+# case_id 1~52 的行自源文件逐字节复制（ID 与内容冻结不变，含白盒 42~52——归属白盒节点，
+# 其 note 引用的 tiling 实测/源码哈希为 workflow3 基线口径，round-7 若改 tiling/缓冲结构
+# 由白盒节点按新源码复核映射，本节点不改动）。
+# 本轮新增黑盒 9 例（case_id 53~61，见文末分节注释；来源
+# $WORK_DIR/0.1-黑盒测试设计.md 第 8.3 节定稿）：
+#   53~55 rank-0 标量（R3「0 维标量按 1 元素」，上轮为规格外 S2、本轮入规格）；
+#   56~58 mish 极小值点 -1.1924 定点（round-7 回归点名）；
+#   59~60 全 -0 保号路径（[0,0] 仅生成 +0）；61 次正规输入下溢（round-7 回归点名）。
+# note 前缀 L0-/L1-/L2-/WB- 均为测试设计标签，不改 proto 难度，不用于评测器过滤。
+# cases.csv 为展示文件，须与本文件同步（loader 只读本文件）。
+# workflow4 白盒节点（node [5]，2026-11-04）：按 round-7 采纳源码（direction-3b 单tile单TBuf、
+# direction-5 细分核 cap16，mish_kernel.cpp sha256 e6e477a8…）复核白盒 42~52 分支映射——数据字段
+# 与全部黑盒例逐字节冻结未动，仅将 note 中已失效的 workflow3 基线 tiling 推导改为当前源码实测推导
+# （tileElems 权威实测经真 calc_mish_tiling_params 探针：fp32 ubFactor=6912、fp16=13824、bf16=7424，
+# UB=193536B、AIV=40 核，见 $WORK_DIR/5-白盒探针/）；新增白盒 62~71 覆盖 round-7 新分支（细分核
+# 2048/32768/65536/65537 边界、fp16/bf16 整tile无尾块多tile、granuleRem 最大偏斜 r=N-1）。
+# cases.csv 已按派生规则同步重生成（71 例）。
+cases:
+# ===== L0 门槛用例（10 例，case_id 1~10）=====
+- operator: mish
+  case_id: 1
+  input_shape:
+  - [1024, 1024]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L0-float32-1M-对齐-对称小值域（基准直通）"
+- operator: mish
+  case_id: 2
+  input_shape:
+  - [2048, 2048]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "L0-float16-4M-对齐-对称小值域（基准直通）"
+- operator: mish
+  case_id: 3
+  input_shape:
+  - [1024, 1024]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L0-bfloat16-1M-对齐-对称小值域（基准直通）"
+- operator: mish
+  case_id: 4
+  input_shape:
+  - [3]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L0-float32-个位元素1D-最小功能单元"
+- operator: mish
+  case_id: 5
+  input_shape:
+  - [1009, 1021]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "L0-float32-1030189-质数非对齐-尾块非32B路径"
+- operator: mish
+  case_id: 6
+  input_shape:
+  - [8192, 8192]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "L0-float16-67M-大张量≥64M-分块循环边界泛化"
+- operator: mish
+  case_id: 7
+  input_shape:
+  - [2048, 2048]
+  dtype: [float32]
+  attrs: {}
+  value_range: [.nan, .nan]
+  note: "L0-float32-4M-对齐-NaN混合（50%NaN+均匀[-1,1]），NaN位置严格匹配"
+- operator: mish
+  case_id: 8
+  input_shape:
+  - [1024, 1024]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-.inf, .inf]
+  note: "L0-bfloat16-1M-对齐-±Inf混合：-Inf位→NaN、+Inf位→+Inf、其余均匀值"
+- operator: mish
+  case_id: 9
+  input_shape:
+  - [1024, 1024]
+  dtype: [float16]
+  attrs: {}
+  value_range: [0, 0]
+  note: "L0-float16-1M-对齐-全零输入（±0传播，IEEE相等）"
+- operator: mish
+  case_id: 10
+  input_shape:
+  - [1024, 1024]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-65504, 65504]
+  note: "L0-float16-1M-对齐-fp16全值域±65504（大|x|线性区y≈x无溢出）"
+# ===== L1 功能用例（22 例，case_id 11~32）=====
+- operator: mish
+  case_id: 11
+  input_shape:
+  - [2048, 2048]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "L1-float32-4M-对齐-中小域"
+- operator: mish
+  case_id: 12
+  input_shape:
+  - [4096, 4096]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-20, 20]
+  note: "L1-float32-16.8M-对齐-softplus饱和区（|x|>20段y≈x）"
+- operator: mish
+  case_id: 13
+  input_shape:
+  - [363, 367, 373]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-10, 10]
+  note: "L1-float32-49.7M-质数3D-高维+奇numel尾块非对齐"
+- operator: mish
+  case_id: 14
+  input_shape:
+  - [11, 13, 17, 67, 67]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-50, 100]
+  note: "L1-float32-10.9M-5D-非对称值域+奇尾块"
+- operator: mish
+  case_id: 15
+  input_shape:
+  - [255, 8193]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-88, 88]
+  note: "L1-float32-2.1M-非对齐-exp溢出边界（稳定softplus路径）"
+- operator: mish
+  case_id: 16
+  input_shape:
+  - [1000007]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-30, 30]
+  note: "L1-float32-1M-1D质数长向量-非对齐大跨度"
+- operator: mish
+  case_id: 17
+  input_shape:
+  - [2, 3, 7, 13, 101, 203]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-100, 100]
+  note: "L1-float32-11.2M-6D-深度饱和区+奇尾块"
+- operator: mish
+  case_id: 18
+  input_shape:
+  - [4097, 511]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-1000, 1000]
+  note: "L1-float16-2.1M-非对齐-大域线性区+尾块"
+- operator: mish
+  case_id: 19
+  input_shape:
+  - [3, 7, 13, 4003]
+  dtype: [float16]
+  attrs: {}
+  value_range: [0, 20]
+  note: "L1-float16-1.1M-4D-仅正域（tanh正半区）"
+- operator: mish
+  case_id: 20
+  input_shape:
+  - [1537, 769]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-20, -0.5]
+  note: "L1-float16-1.2M-仅负域（mish→0⁻小值区，小值域兜底口径）"
+- operator: mish
+  case_id: 21
+  input_shape:
+  - [2, 3, 5, 7, 11, 13, 17, 19]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-8, 8]
+  note: "L1-float16-4.8M-8D-rank上界+奇尾块"
+- operator: mish
+  case_id: 22
+  input_shape:
+  - [1000007]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-65504, 65504]
+  note: "L1-float16-1M-1D-fp16全值域极值+非对齐"
+- operator: mish
+  case_id: 23
+  input_shape:
+  - [2048, 2048]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-10, 10]
+  note: "L1-bfloat16-4.2M-对齐-中域"
+- operator: mish
+  case_id: 24
+  input_shape:
+  - [4096, 4096]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-100, 100]
+  note: "L1-bfloat16-16.8M-对齐-深饱和区（大值线性区）"
+- operator: mish
+  case_id: 25
+  input_shape:
+  - [255, 8193]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-0.01, 0.01]
+  note: "L1-bfloat16-2.1M-非对齐-微小值域（次正规输出区）"
+- operator: mish
+  case_id: 26
+  input_shape:
+  - [3, 5, 7, 11, 13, 17, 23]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-50, 50]
+  note: "L1-bfloat16-5.9M-7D-rank7+奇尾块"
+- operator: mish
+  case_id: 27
+  input_shape:
+  - [4097, 511]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-3.39e38, 3.39e38]
+  note: "L1-bfloat16-2.1M-非对齐-bf16全值域（y≈x极值无溢出）"
+- operator: mish
+  case_id: 28
+  input_shape:
+  - [1000007]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [0, 10]
+  note: "L1-bfloat16-1M-1D-仅正域+非对齐"
+- operator: mish
+  case_id: 29
+  input_shape:
+  - [4097, 511]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-0.5, 0.5]
+  note: "L1-float32-2.1M-非对齐-微小值域（小值域口径）"
+- operator: mish
+  case_id: 30
+  input_shape:
+  - [512, 2049]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-3.4e38, 3.4e38]
+  note: "L1-float32-1M-非对齐-fp32全值域（极值线性区）"
+- operator: mish
+  case_id: 31
+  input_shape:
+  - [1009, 1021]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-0.001, 0.001]
+  note: "L1-float16-1M-质数非对齐-微小值域（fp16次正规区误差可控）"
+- operator: mish
+  case_id: 32
+  input_shape:
+  - [512, 2049]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-88, 88]
+  note: "L1-bfloat16-1M-非对齐-fp32exp溢出边界跨dtype"
+# ===== L2 异常/边界用例（9 例，case_id 33~41）=====
+- operator: mish
+  case_id: 33
+  input_shape:
+  - [0]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-float32-空tensor-输出空（0元素空判口径）"
+- operator: mish
+  case_id: 34
+  input_shape:
+  - [0]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-float16-空tensor-输出空（0元素空判口径）"
+- operator: mish
+  case_id: 35
+  input_shape:
+  - [0]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-bfloat16-空tensor-输出空（0元素空判口径）"
+- operator: mish
+  case_id: 36
+  input_shape:
+  - [1024]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-.inf, -.inf]
+  note: "L2-float32-1K-纯-Inf→全NaN（钉住mish(-Inf)=NaN语义，-Inf输出y=x即失败）"
+- operator: mish
+  case_id: 37
+  input_shape:
+  - [1024]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [.inf, .inf]
+  note: "L2-bfloat16-1K-纯+Inf→全+Inf（同号匹配）"
+- operator: mish
+  case_id: 38
+  input_shape:
+  - [2048]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-.inf, .inf]
+  note: "L2-float16-2K-1D-±Inf混合（首5%-Inf位→NaN、尾5%+Inf位→+Inf、中段均匀值）"
+- operator: mish
+  case_id: 39
+  input_shape:
+  - [1]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-float32-单元素-最小shape"
+- operator: mish
+  case_id: 40
+  input_shape:
+  - [2, 3]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "L2-float16-个位元素2D-小块正确"
+- operator: mish
+  case_id: 41
+  input_shape:
+  - [17, 31]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "L2-bfloat16-527-小块非对齐（奇numel尾块非32B路径）"
+# ===== 白盒用例（11 例，case_id 42~52）=====
+# 42~49 上轮追加（shape/dtype/value_range 未变），note 已按本轮源码（4b03e8c7…）复核改写；
+# 50~52 本轮新增。tiling 权威实测：fp32 tileElems=6912、fp16/bf16=7424、AIV=40 核
+# （2-探针-tiling实测.log）；每核划分 = base(blockLength) + 前 r 核各 +1 granule(512B)。
+- operator: mish
+  case_id: 42
+  input_shape:
+  - [1024, 245]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-250880-40核x6272-单tile轻量one-TBuf路径（2026-11-04白盒节点按round-7采纳源码复核：fine=123、coarse=62>16→capOrCoarse=62→numBlocks=62封顶40核；bl=6272,gr=0均分；每核6272≤ubFactor 6912→singleTile_=true（tileNum_=0,tail=6272,tiles_=1，比较直判免除法）→SingleTileProcess单TBuf按核实际长度分区+MTE2_V/V_MTE3显式事件；needCast=false）"
+- operator: mish
+  case_id: 43
+  input_shape:
+  - [1024, 490]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "WB-float32-501760-40核x12544-流水线2tile含尾块（tileNum=1,tail=5632,tiles=2；r=0；预取尾tile臂nextN=(i+1<tileNum)假侧；needCast=false）"
+- operator: mish
+  case_id: 44
+  input_shape:
+  - [1024, 560]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "WB-float16-573440-40核x14336-流水线2tile含尾块（2026-11-04白盒节点按round-7采纳源码复核：fp16 ubFactor实测13824（UB 193536B/14B每元，原note按workflow3基线7424推导的tail=6912已失效），14336>13824→tileNum=1,tail=512,tiles=2；r=0；预取尾tile臂nextN=(i+1<tileNum)假侧；双缓冲队列+合并scratch TBuf；needCast=true原生fp16链）"
+- operator: mish
+  case_id: 45
+  input_shape:
+  - [1024, 280]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "WB-bfloat16-286720-40核x7168-单tile轻量路径（bf16模板实例；7168<7424→tileNum=0,tail=7168,tiles=1；r=0；needCast=true）"
+- operator: mish
+  case_id: 46
+  input_shape:
+  - [4096, 10]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-8, 8]
+  note: "WB-float32-40960-16核细分核上界cap侧（2026-11-04白盒节点按round-7采纳源码复核：fine=ceil(40960/2048)=20>16、coarse=10<16→capOrCoarse=16→numBlocks=16（round-7方向⑤SMALL_ZONE_CORE_CAP=16；原note按workflow3基线1024阈值40核推导已失效）；bl=2560,gr=0；每核2560≤6912→16核并发单tile轻量one-TBuf路径）"
+- operator: mish
+  case_id: 47
+  input_shape:
+  - [40961]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-8, 8]
+  note: "WB-float32-40961-16核cap+1截断侧（2026-11-04白盒节点按round-7采纳源码复核：fine=21>16、coarse=11→numBlocks=16；unitTotal=321→bl=2560,gr=1→核0=2560+128=2688；末核起点38528,end=41088>total→钳制至2433（单tile路径钳制分支；原note按workflow3基线41核截断40核、bl=1024推导已失效））"
+- operator: mish
+  case_id: 48
+  input_shape:
+  - [1025]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-1025-细分核2048阈值下单核侧+首核钳制（2026-11-04白盒节点按round-7采纳源码复核：fine=ceil(1025/2048)=1→单核；unitTotal=9→bl=1152>total→钳制至1025；singleTile_=true；原note按workflow3基线MIN_ELEMS_PER_CORE=1024的2核推导已失效（round-7该阈值改为4096+方向⑤2048细分，1025现归单核）；与C36的1024单核granule对齐侧构成钳制两侧）"
+- operator: mish
+  case_id: 49
+  input_shape:
+  - [2048]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-.inf, .inf]
+  note: "WB-float32-2048-±Inf混合-fp32实例化（2026-11-04白盒节点按round-7采纳源码复核：fine=ceil(2048/2048)=1→单核单tile轻量路径（2048≤6912，原note按workflow3基线2核推导已失效）；needCast=false；IEEE特殊值经fp32链传播非空洞NaN检查；补C36纯-Inf/C37纯+Inf/C8-bf16/C38-fp16的dtype空缺）"
+- operator: mish
+  case_id: 50
+  input_shape:
+  - [1024, 540]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-552960-40核x13824(=2x6912)整tile无尾块（tailTileElementNum=0→tiles=tileNum=2；tiles=tileNum+(tail>0?1:0)假臂；预取满tile臂(i+1<tileNum)；r=0均分；needCast=false；本轮新增补当前源码无尾块多tile缺口）"
+- operator: mish
+  case_id: 51
+  input_shape:
+  - [1024, 580]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "WB-float16-593920-40核x14848-流水线小尾块（2026-11-04白盒节点按round-7采纳源码复核：fp16 ubFactor实测13824（非workflow3基线7424），14848>13824→tileNum=1,tail=1024,tiles=2；r=0；本例在当前源码下由整tile无尾块转为尾块覆盖（fp16无尾块缺口由新增WB-68接替））"
+- operator: mish
+  case_id: 52
+  input_shape:
+  - [276481]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-6, 6]
+  note: "WB-float32-276481-单tile/流水线路径边界+1（2026-11-04白盒节点按round-7采纳源码复核：r=1；核0=6912+128=7040→tileNum=1,tail=128,tiles=2流水线小尾块；核1~38=6912恰等于ubFactor→比较直判singleTile_=true满tile单tile侧（免除法边界取等）；核39 end=276608>total→钳制至6785；同一launch三执行路径并存）"
+
+# ===== workflow4 新增黑盒用例（case_id 53~61，来源 $WORK_DIR/0.1-黑盒测试设计.md 第 5 章）=====
+# 覆盖缺口依据：R3「0 维标量按 1 元素」（53~55，上轮为规格外 S2、本轮入规格）；
+# round-7 回归点名 -1.1924（56~58，cannbot工作流prompt.md 验收标准行）；
+# 特殊值 ±0 保号的 -0 路径（59~60，[0,0] 仅生成 +0）；「次正规」输入侧下溢（61）。
+- operator: mish
+  case_id: 53
+  input_shape:
+  - []
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-float32-rank0-0维标量按1元素（输出0维同shape，numel=1）"
+- operator: mish
+  case_id: 54
+  input_shape:
+  - []
+  dtype: [float16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-float16-rank0-0维标量按1元素（fp16口径）"
+- operator: mish
+  case_id: 55
+  input_shape:
+  - []
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "L2-bfloat16-rank0-0维标量按1元素（bf16口径）"
+- operator: mish
+  case_id: 56
+  input_shape:
+  - [2048, 2048]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-1.1924, -1.1924]
+  note: "L1-float32-4M-对齐-mish极小值点定点（x=-1.1924→y≈-0.308843，round-7回归点名）"
+- operator: mish
+  case_id: 57
+  input_shape:
+  - [2048, 2048]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-1.1924, -1.1924]
+  note: "L1-float16-4M-对齐-mish极小值点定点（量化-1.1923828125，fp16原生链该点精度）"
+- operator: mish
+  case_id: 58
+  input_shape:
+  - [2048, 2048]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-1.1924, -1.1924]
+  note: "L1-bfloat16-4M-对齐-mish极小值点定点（量化-1.1953125，Cast→fp32链该点精度）"
+- operator: mish
+  case_id: 59
+  input_shape:
+  - [1024, 1024]
+  dtype: [float32]
+  attrs: {}
+  value_range: ["-0", "-0"]
+  note: "L2-float32-1M-对齐-全-0输入（signbit=1保号路径；C9的[0,0]仅生成+0）"
+- operator: mish
+  case_id: 60
+  input_shape:
+  - [1024, 1024]
+  dtype: [float16]
+  attrs: {}
+  value_range: ["-0", "-0"]
+  note: "L2-float16-1M-对齐-全-0输入（fp16原生链保号风险最高路径；bf16经Cast与fp32同语义不单列）"
+- operator: mish
+  case_id: 61
+  input_shape:
+  - [4096]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-1.0e-7, 1.0e-7]
+  note: "L2-float16-4K-1D-次正规输入下溢（次正规/零混合输入→y=x²/2下溢0，无NaN；round-7回归点名次正规输入侧）"
+
+# ===== workflow4 白盒节点新增用例（case_id 62~71，2026-11-04，来源 $WORK_DIR/5-白盒测试设计.md）=====
+# 依据：round-7 采纳源码（direction-3b 单tile单TBuf、direction-5 细分核 cap16）的分支复核与新分支覆盖；
+# tiling 权威实测（真 calc_mish_tiling_params 探针，UB=193536B、AIV=40 核）：
+# fp32 ubFactor=6912、fp16=13824、bf16=7424；每核划分 = bl + 前 r 核各 +1 granule(fp32=128元/fp16·bf16=256元)。
+- operator: mish
+  case_id: 62
+  input_shape:
+  - [2049]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-2049-方向⑤细分核2048阈值+1侧（fine=ceil(2049/2048)=2核、coarse=1<16→capOrCoarse=16→numBlocks=2；unitTotal=17→bl=1024,gr=1→核0=1024+128=1152单tile；核1起点1152,end=2176>total→钳制至897；与C63的2048单核构成SPLIT_THRESHOLD_FINE=2048阈值两侧；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 63
+  input_shape:
+  - [2048]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-2048-方向⑤细分核2048阈值取等侧（fine=ceil(2048/2048)=1→单核单tile轻量路径（2048≤6912）；与C62构成阈值两侧；与C49同shape但C49为±Inf值域、本例为常规值域；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 64
+  input_shape:
+  - [32768]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-32768-fine==cap取等16核（fine=ceil(32768/2048)=16=SMALL_ZONE_CORE_CAP→numBlocks=16；bl=2048,gr=0全核均分；每核2048≤6912单tileone-TBuf；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 65
+  input_shape:
+  - [32769]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-32769-16核cap生效侧（fine=17>16、coarse=9<16→capOrCoarse=16→numBlocks=16；bl=2048,gr=1→核0=2048+128=2176；末核起点30848,end=32896>total→钳制至1921；与C64构成cap取等/+1两侧；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 66
+  input_shape:
+  - [65536]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-65536-细分区上沿（fine=32、coarse=ceil(65536/4096)=16=cap→numBlocks=16，方向⑤65536上沿取等点：total>65536时表达式恰退化回ceil(total/4096)基线策略；bl=4096,gr=0；每核4096≤6912单tile；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 67
+  input_shape:
+  - [65537]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-65537-退化回基线策略侧（coarse=ceil(65537/4096)=17>16→capOrCoarse=17→numBlocks=min(32,17)=17核=ceil(total/4096)（round-6基线策略恢复）；unitTotal=513→bl=3840,gr=3→核0~2=3840+128=3968、核3~16=3840；末核起点61824,end=65664>total→钳制至3713；与C66构成65536两侧；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 68
+  input_shape:
+  - [8192, 135]
+  dtype: [float16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "WB-float16-1105920-40核x27648(=2x13824)整tile无尾块（fp16 ubFactor实测13824（UB 193536B核算），接替C51在当前源码下失效的fp16无尾块多tile分支：tileNum=2,tail=0→tiles=tileNum（tail>0假臂）；r=0均分；预取满tile臂(i+1<tileNum)；needCast=true原生fp16链双缓冲+合并scratch TBuf；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 69
+  input_shape:
+  - [2049]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-bfloat16-2049-方向⑤细分核2核+钳制+bf16Cast路径（fine=2核；unitTotal=9→bl=1024,gr=1→核0=1024+256=1280单tile（bf16经Cast→fp32链，x32暂存4槽ScratchSlot切片）；核1起点1280,end=2304>total→钳制至769；与C62同型fp32侧互补bf16模板实例；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 70
+  input_shape:
+  - [1024, 580]
+  dtype: [bfloat16]
+  attrs: {}
+  value_range: [-4, 4]
+  note: "WB-bfloat16-593920-40核x14848(=2x7424)整tile无尾块（bf16 ubFactor实测7424（UB核算-512余量后按granule取整），锁定bf16Cast路径无尾块多tile分支：tileNum=2,tail=0；r=0；needCast=true（CAST_NONE入/CAST_RINT出）双缓冲；2026-11-04白盒节点新增）"
+- operator: mish
+  case_id: 71
+  input_shape:
+  - [34688]
+  dtype: [float32]
+  attrs: {}
+  value_range: [-2, 2]
+  note: "WB-float32-34688-granuleRem最大偏斜r=numBlocks-1（fine=17>16、coarse=9→numBlocks=16；unitTotal=271→bl=2048,gr=15：核0~14各2048+128=2176、核15恰收2048无钳制（end=34688=total）；granule base+r分配偏斜上界侧（(blkIdx<r)条件近全真）；2026-11-04白盒节点新增）"
