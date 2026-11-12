@@ -81,45 +81,15 @@ static inline const gert::Shape EnsureNotScalar(const gert::Shape& in_shape) {
     return in_shape;
 }
 
-// round-9: per-thread memoization of the tiling result. The benchmark repeats
-// the same (shape, dtype) many times; the platform query (PlatformAscendC
-// construction + core/UB queries) and the divisions are then skipped. The key
-// is runtime generic (platform pointer, total elements, dtype) - no shape
-// specialization; thread_local keeps it safe for concurrent tiling calls.
-struct MishTilingCacheEntry {
-    bool valid = false;
-    const void* platform = nullptr;
-    int64_t totalNum = 0;
-    ge::DataType dtype = ge::DT_UNDEFINED;
-    MishTilingData data;
-    uint64_t tilingKey = 0;
-    uint64_t blockDim = 0;
-};
-
-static thread_local MishTilingCacheEntry g_mishTilingCache;
-
-static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, fe::PlatFormInfos* platformInfoPtr,
-    uint64_t& ubSize, int64_t& coreNum)
+static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, int64_t& coreNum)
 {
+    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
     OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
-    // Platform facts are constant per device in a process; cache them per
-    // thread so alternating shapes still avoid the query.
-    static thread_local const void* cachedPlatform = nullptr;
-    static thread_local uint64_t cachedUbSize = 0;
-    static thread_local int64_t cachedCoreNum = 0;
-    if (platformInfoPtr == cachedPlatform && cachedUbSize != 0 && cachedCoreNum != 0) {
-        ubSize = cachedUbSize;
-        coreNum = cachedCoreNum;
-        return ge::GRAPH_SUCCESS;
-    }
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
     coreNum = ascendcPlatform.GetCoreNumAiv();
     OP_CHECK_IF(coreNum == 0, OP_LOGE(context, "coreNum is 0"), return ge::GRAPH_FAILED);
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     OP_CHECK_IF(ubSize == 0, OP_LOGE(context, "ubSize is 0"), return ge::GRAPH_FAILED);
-    cachedPlatform = platformInfoPtr;
-    cachedUbSize = ubSize;
-    cachedCoreNum = coreNum;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -133,16 +103,20 @@ static ge::graphStatus GetWorkspaceSize(gert::TilingContext* context)
 
 static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
 {
-    MishTilingData* tiling = context->GetTilingData<MishTilingData>();
-    OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-
-    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
-    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
+    uint64_t ubSize;
+    int64_t coreNum;
+    OP_CHECK_IF(
+        GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS,
+        OP_LOGE(context, "GetPlatformInfo error"),
+        return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(
         GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
         OP_LOGE(context, "GetWorkspaceSize error"),
         return ge::GRAPH_FAILED);
+
+    MishTilingData* tiling = context->GetTilingData<MishTilingData>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
 
     // 元素总数（0 维标量按 1 元素处理）
     const gert::StorageShape* inputShape = context->GetInputShape(0);
@@ -162,23 +136,6 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
     } else {
         tilingKey = GET_TPL_TILING_KEY(MISH_TPL_SCH_MODE_1);
     }
-
-    // round-9 per-thread tiling memoization: repeated calls with the same
-    // platform/shape/dtype skip the platform query and all divisions.
-    if (g_mishTilingCache.valid && g_mishTilingCache.platform == platformInfoPtr &&
-        g_mishTilingCache.totalNum == totalNum && g_mishTilingCache.dtype == dtype) {
-        *tiling = g_mishTilingCache.data;
-        context->SetBlockDim(g_mishTilingCache.blockDim);
-        context->SetTilingKey(g_mishTilingCache.tilingKey);
-        return ge::GRAPH_SUCCESS;
-    }
-
-    uint64_t ubSize;
-    int64_t coreNum;
-    OP_CHECK_IF(
-        GetPlatformInfo(context, platformInfoPtr, ubSize, coreNum) != ge::GRAPH_SUCCESS,
-        OP_LOGE(context, "GetPlatformInfo error"),
-        return ge::GRAPH_FAILED);
 
     // 每 tile 元素数：沿用 round-7 的保守逐缓冲核算，宽度/数量按 dtype 路由。
     //   float32：3 个 fp32 等价 scratch -> 12 + 16 = 28 B/元素 -> 6912
@@ -234,14 +191,6 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
 
     context->SetBlockDim(numBlocks);
     context->SetTilingKey(tilingKey);
-
-    g_mishTilingCache.valid = true;
-    g_mishTilingCache.platform = platformInfoPtr;
-    g_mishTilingCache.totalNum = totalNum;
-    g_mishTilingCache.dtype = dtype;
-    g_mishTilingCache.data = *tiling;
-    g_mishTilingCache.tilingKey = tilingKey;
-    g_mishTilingCache.blockDim = static_cast<uint64_t>(numBlocks);
     return ge::GRAPH_SUCCESS;
 }
 
