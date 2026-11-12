@@ -164,3 +164,27 @@ TPipe-free 单tile路径 + q折叠E3链兑现；但隐藏大 shape 点提升有�
 3. mish_def.cpp（模板文件）也要写入并校验——编辑器会持久化上次提交的所有内容，包括污染
 4. 提交点击后必须确认 URL 跳转到 /submission/ 才算成功（冷却期点击静默失败）
 5. 检查提交结果用新标签页导航，绝不能离开 /submit（编辑器状态丢失 = 全部重做）
+
+# 追加记录（2026-11-12 23:37 round9 提交：Runtime Error）
+
+| 事件 | 结果 | 说明 |
+|---|---|---|
+| #1302002 (23:37:11) | **Runtime Error（全部 50 点，输出错误 100%）** | r9 host tiling thread_local 记忆化 |
+
+传输侧无误（6 文件全部逐字节回读校验后提交，其中 r9 tiling.cpp 经键入+全文比对一致；
+mish.cpp 无"1"前缀；mish.h/def 完好）。编译通过 → 崩溃在运行期，指向 r9 唯一改动
+（host 侧 thread_local 记忆化）在平台执行模型下不安全。
+
+**给开发 agent 的诊断线索（r9 报告对照）**：
+1. 最可疑：缓存命中路径若跳过 `context->GetTilingData<MishTilingData>()` 的重新写入
+   （totalNum/blockFactor/ubFactor/granuleRem + SetBlockDim + SetTilingKey），
+   当前 context 的 tiling 缓冲区即为未初始化垃圾 → kernel 读垃圾 → RE（全点 100% 错误与此吻合）
+2. 次可疑：memo key 含 TilingContext/platform 指针——若平台每次调用 context 指针不同则永不命中（不该崩）；
+   若生命周期跨调用失效则更糟
+3. 建议修复：只记忆化进程不变量（GetPlatformInfo 的 ubSize/coreNum，指针键去掉），
+   tiling 结构体每调用仍完整写入 context；或直接回退 r8 tiling（平台已 Pass 版）再重设计
+4. 平台 UI 无 Runtime Error 详情日志可取（弹窗不展开），本地直调环境无法复现平台 aclnn
+   线程模型——请开发 agent 在直调工程里模拟"同 shape 连续两次 aclnn 调用"用例验证记忆化
+
+榜单无损失（平台取历史最优：69.97 第 28 名保持）。本传输通道经验：粘贴通道今晚失效过一轮
+（剪贴板正确但 CTRL+V 不落），cua.type 键入在 11KB 文件上完整保留空行且逐字节正确——两条通道互为备份。
