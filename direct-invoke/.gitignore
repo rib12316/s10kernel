@@ -10,3 +10,6 @@ dist/
 *.whl
 *.o
 *.run
+
+# local profiling outputs (round-8)
+reports/

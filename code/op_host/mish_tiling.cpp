@@ -7,11 +7,13 @@
  *
  * 第三轮优化同步（与本地直调最终版逐参数一致）：
  *   1. 计算链按 dtype 路由（kernel 侧 mish.h），tileElems 核算随之路由：
- *      float32 为 3 个 fp32 scratch（28 B/元素）；float16 为 fp16 原生链，
- *      3 个 fp16 scratch（14 B/元素，tile 7680 -> 13824）；bfloat16 无原生
- *      向量算术（dav_c220 上 Exp/Add/Mul/Div 仅支持 half/float），保持
- *      Cast->fp32 路线的 4 个 fp32 scratch（24 B/元素，精确取值恰为
- *      100.0% UB，保留 512 元素余量防越界——分支条件仅为 dtype）。
+ *      float32 为 2 个 fp32 scratch（24 B/元素，round-8 由 28 降）；float16
+ *      为 fp16 原生链，2 个 fp16 scratch（12 B/元素，tile 13824 -> 16128）；
+ *      bfloat16 无原生向量算术（dav_c220 上 Exp/Add/Mul/Div 仅支持
+ *      half/float），保持 Cast->fp32 路线的 3 个 fp32 scratch（20 B/元素，
+ *      精确取值恰为 100.0% UB，保留 512 元素余量防越界——分支条件仅为
+ *      dtype）。round-8 把 Div 目的并入输出 y（bf16 为 x32），独立 q scratch
+ *      取消，故各 dtype scratch 数 3/3/4 -> 2/2/3。
  *   2. 每核最少元素数 1024 -> 4096（round-3）：小张量少拉核、摊薄块调度
  *      与 MTE 串行延迟的固定开销。MIN 值为运行时通用量推导的阈值，与任何
  *      测试 shape 无关。
@@ -61,8 +63,13 @@ constexpr int64_t MIN_SPLIT_THRESHOLD = 4096;  // 每核最少元素数（基线
 constexpr int64_t SPLIT_THRESHOLD_FINE = 2048;    // round-7 D5：细粒度每核元素数（仅小区间生效）
 constexpr int64_t SMALL_ZONE_CORE_CAP = 16;       // round-7 D5：实测小区间最优核数封顶
 constexpr int64_t PIPELINE_DEPTH = 2;          // 队列深度（与 kernel BUFFER_NUM 一致）
-constexpr int64_t SCRATCH_NATIVE = 3;          // 原生链 scratch 数（e/p/常量或 q），宽度随 dtype
-constexpr int64_t SCRATCH_BF16 = 4;            // bf16 Cast 路线 scratch 数（x32/e/p/常量），fp32 宽度
+// round-8：kernel 实际只分配 2 个 native / 3 个 bf16 scratch（q 并入输出
+// y/x32），但 tile 尺寸核算刻意保留 round-7 粒度（等价 3 native / 4 bf16
+// scratch）。2026-11-12 直调 mini case A/B：把省出的 UB 换成更大 tile 会使
+// 中等多 tile 点回退 1.0~3.4%（双缓冲流水粒度变粗），小 shape 无变化；多余
+// UB 作为 headroom 保留。常量仅由 ubSize 与 dtype 宽度推导，无 shape 特化。
+constexpr int64_t SCRATCH_NATIVE = 3;          // tile 尺寸核算：round-7 native 粒度
+constexpr int64_t SCRATCH_BF16 = 4;            // tile 尺寸核算：round-7 bf16 粒度
 constexpr int64_t GRANULE_BYTES = 512;         // MTE 传输粒度（字节），对齐与划分共用
 
 static const gert::Shape g_vec_1_shape = {1};
@@ -130,13 +137,14 @@ static ge::graphStatus MishTilingFunc(gert::TilingContext* context)
         tilingKey = GET_TPL_TILING_KEY(MISH_TPL_SCH_MODE_1);
     }
 
-    // 每 tile 元素数：精确逐缓冲核算，scratch 宽度/数量按 dtype 路由。
-    //   float32：3 个 fp32 scratch（e/p/q）
-    //   float16：fp16 原生 E3 链，3 个 fp16 scratch（e/p/q，常量全为标量）
-    //   bfloat16：Cast 路线 4 个 fp32 scratch（x32/e/p/q），精确值恰取满
+    // 每 tile 元素数：沿用 round-7 的保守逐缓冲核算，宽度/数量按 dtype 路由。
+    //   float32：3 个 fp32 等价 scratch -> 12 + 16 = 28 B/元素 -> 6912
+    //   float16：3 个 fp16 等价 scratch -> 6 + 8  = 14 B/元素 -> 13824
+    //   bfloat16：4 个 fp32 等价 scratch -> 16 + 8 = 24 B/元素，精确值恰取满
     //             100.0% UB，减 512 元素（~12KB）留系统区余量
     // 队列侧每元素占 PIPELINE_DEPTH * 2（入/出）* dtypeWidth 字节。
-    // （round-7 起 scratch 为单 TBuf 合一切片，总字节数不变，核算口径不变。）
+    // kernel 实际分配比核算少 1 个 scratch（round-8 q 并入输出），差额为
+    // 刻意保留的 headroom，见 SCRATCH_NATIVE 注释。
     const bool nativeWidth = (dtype == ge::DT_FLOAT) || (dtype == ge::DT_FLOAT16);
     const int64_t scratchBytes = nativeWidth ? (SCRATCH_NATIVE * dtypeWidth) : (SCRATCH_BF16 * TYPE_SIZE);
     const int64_t bytesPerElement = scratchBytes + PIPELINE_DEPTH * 2 * dtypeWidth;

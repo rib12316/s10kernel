@@ -53,13 +53,15 @@
  *
  * dtype routing (branch condition is dtype identity only - a runtime generic
  * quantity):
- *   - float32:  fp32 E3 chain (3 fp32 scratch, 28 B/element UB accounting)
- *   - float16:  native fp16 E3 chain with p' = min(p, 65504) clamp (3 fp16
- *     scratch, 14 B/element; fp16 vector pipeline does not FTZ subnormals -
- *     the quotient-first ordering keeps |q| <= 1 so y never exceeds the dtype
- *     maximum)
+ *   - float32:  fp32 E3 chain (2 fp32 scratch e/p actually allocated; the
+ *     tile-size accounting deliberately retains the round-7 28 B/element)
+ *   - float16:  native fp16 E3 chain with p' = min(p, 65504) clamp (2 fp16
+ *     scratch e/p allocated, round-7 14 B/element accounting; fp16 vector
+ *     pipeline does not FTZ subnormals - the quotient-first ordering keeps
+ *     |q| <= 1 so y never exceeds the dtype maximum)
  *   - bfloat16: no native bf16 vector arithmetic on dav_c220; Cast -> fp32 E3
- *     chain -> CAST_RINT back (4 fp32 scratch, 24 B/element)
+ *     chain -> CAST_RINT back (3 fp32 scratch x32/e/p allocated, round-7
+ *     24 B/element accounting)
  *
  * Structure (rounds 2..6, all validated on device):
  *   - single-tile cores (small tensors: every assigned element fits in one UB
@@ -103,8 +105,12 @@ constexpr float FLT_MAX_FINITE = 3.402823466e+38f;
 // 7 ops, single Div, all constants scalar broadcasts (no constant tile, no
 // prologue fill). Range safety (+Inf/-Inf/NaN/±0/large-positive exp-overflow
 // region/small-negative subnormal region) documented in the platform baseline.
-// Buffer roles: xT read-only input; eT evolves e->w; pT evolves a->p' (after
-// clamp); qT independent Div destination; y receives the result.
+// round-8: only TWO scratch tensors (e, p). The Div lands directly in the
+// output tensor y (q is consumed immediately by y = q*p'), removing the third
+// scratch tile (qT) and its UB/buffer bookkeeping. For bfloat16 the fp32
+// chain's output tensor is the Cast staging buffer x32, so the same aliasing
+// applies. Buffer roles: xT read-only input; eT evolves e->w; pT evolves
+// a->p' (after clamp); y receives q then the final result.
 template <typename T>
 __aicore__ inline constexpr T MishDtypeMaxFin()
 {
@@ -117,7 +123,7 @@ __aicore__ inline constexpr T MishDtypeMaxFin()
 
 template <typename T>
 __aicore__ inline void MishE3Chain(const LocalTensor<T> xT, LocalTensor<T> eT,
-    LocalTensor<T> pT, LocalTensor<T> qT, LocalTensor<T> y, int32_t count)
+    LocalTensor<T> pT, LocalTensor<T> y, int32_t count)
 {
     constexpr T kDtypeMax = MishDtypeMaxFin<T>();
     Exp<T>(eT, xT, count);                              // e = exp(x)
@@ -125,8 +131,8 @@ __aicore__ inline void MishE3Chain(const LocalTensor<T> xT, LocalTensor<T> eT,
     Mul<T>(pT, eT, pT, count);                          // p = e(e+2)
     Mins<T>(pT, pT, kDtypeMax, count);                  // p' = min(p, dtype maximum finite)
     Adds<T>(eT, pT, static_cast<T>(2.0), count);        // w = p' + 2 (reuse eT)
-    Div<T>(qT, xT, eT, count);                          // q = x / w
-    Mul<T>(y, qT, pT, count);                           // y = q * p'
+    Div<T>(y, xT, eT, count);                           // q = x / w  (y doubles as the q slot)
+    Mul<T>(y, y, pT, count);                            // y = q * p'
 }
 
 // dtype routing (compile-time, keyed on dtype identity)
@@ -134,6 +140,22 @@ template <typename T>
 __aicore__ inline constexpr bool MishIsHalf()
 {
     return IsSameType<T, half>::value;
+}
+
+// round-8 single-tile raw layout helpers (bytes aligned to the 512B MTE
+// granule; the LocalTensor descriptor length is rounded to 32B because the
+// raw constructor requires a 32B-aligned byte length).
+__aicore__ inline int64_t AlignGranule(int64_t bytes)
+{
+    return (bytes + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
+}
+
+template <typename T>
+__aicore__ inline uint32_t RawTensorElems(int32_t count)
+{
+    constexpr int64_t kElemBytes = static_cast<int64_t>(sizeof(T));
+    const int64_t bytes = (static_cast<int64_t>(count) * kElemBytes + 31) / 32 * 32;
+    return static_cast<uint32_t>(bytes / kElemBytes);
 }
 
 template <typename T>
@@ -151,25 +173,22 @@ private:
     __aicore__ inline void CopyInTile(int64_t tileIdx, int64_t tileElemNum);
     __aicore__ inline void SingleTileProcess();
     // round-7 direction-3: element-offset view into the shared scratch TBuf
-    // (slot extent = one tile of the compute dtype)
+    // (slot extent = one tile of the compute dtype). Multi-tile path only;
+    // the single-tile path uses raw UB addresses and constructs its tensors
+    // directly (round-8 TPipe-free layout).
     template <typename CT>
     __aicore__ inline AscendC::LocalTensor<CT> ScratchSlot(int32_t slot)
     {
-        if (singleTile_) {
-            return bufSingle.template Get<CT>()[static_cast<uint32_t>(singleTileOffsetS_ + slot * singleTileStrideS_)];
-        }
         return bufScratch.template Get<CT>()[static_cast<uint32_t>(slot) * static_cast<uint32_t>(elemPerTile_)];
     }
 
 private:
-    TPipe pipe;
+    // round-8: no TPipe member. The single-tile path is TPipe-free (raw UB
+    // tensors + fixed event IDs); the multi-tile path constructs a local
+    // TPipe in Process() and allocates only there.
     TQue<QuePosition::VECIN, BUFFER_NUM> inputQueueX;
     TQue<QuePosition::VECOUT, BUFFER_NUM> outputQueueY;
-    TBuf<TPosition::VECCALC> bufSingle;                // direction-3b: single-tile one-TBuf region
-    TBuf<TPosition::VECCALC> bufScratch;               // round-7 direction-3: one allocation, hand-sliced
-    int64_t singleTileOffsetY_ = 0;                    // y region element offset inside bufSingle
-    int64_t singleTileOffsetS_ = 0;                    // scratch region element offset inside bufSingle
-    int64_t singleTileStrideS_ = 0;                    // scratch slot stride (CT elements, granule-aligned)
+    TBuf<TPosition::VECCALC> bufScratch;               // one allocation, hand-sliced
 
     GlobalTensor<T> inputGMX;
     GlobalTensor<T> outputGMY;
@@ -188,19 +207,11 @@ template <typename T>
 __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, int64_t totalNum, int64_t blockFactor,
     int64_t ubFactor, int64_t granuleRem)
 {
-    constexpr bool kIsHalf = MishIsHalf<T>();
-    constexpr bool kIsFloat = (sizeof(T) == static_cast<size_t>(FLOAT_BYTES));
-    // scratch width routed by dtype: float 3x4B | half 3x2B | bfloat16 4x4B (x32);
-    // per-element UB accounting happens host-side in calc_mish_tiling_params.
-    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
-
     totalLength_ = totalNum;
     // blockFactor is the 512B-granule uniform base length (first r cores carry
     // one extra granule; r re-assembled below from granuleRem).
     blockLength_ = blockFactor;
     elemPerTile_ = ubFactor;
-    const int64_t tileBytesT = elemPerTile_ * static_cast<int64_t>(sizeof(T));
-    const int64_t tileBytesS = elemPerTile_ * scratchWidth;
 
     // Per-core extent: 512B granule base+r split (round-5: r handed down by the
     // host via the granuleRem tiling field, always 0 <= r < numBlocks - no
@@ -238,32 +249,9 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, int64_t totalNum, int
         tiles_ = 0;  // empty-tensor guard (tiles == 0: Process returns immediately)
     }
 
-    // round-7 direction-3: e/p/q evolving scratch (bfloat16 additionally
-    // stages x32) share ONE TBuf allocation; the chain slices it by element
-    // offset below.  InitBuffer calls per core drop 5->3 (fp32/fp16) and
-    // 6->3 (bfloat16) - one TPipe bookkeeping pass shorter at every launch.
-    constexpr int64_t SCRATCH_COUNT = (kIsFloat || kIsHalf) ? 3 : 4;
-    if (singleTile_) {
-        // round-7 direction-3b: on the latency-critical single-tile path the
-        // x/y/scratch regions live in ONE TBuf sized to the ACTUAL per-core
-        // length (each region 512B-aligned, so every slice stays granule
-        // aligned).  The full-tile buffers of the base version allocated
-        // ~138 KiB per core for a 4 KiB workload; the actual-size allocation
-        // removes the difference and cuts the single-tile path to exactly
-        // one InitBuffer call.
-        int64_t region = currentBlockLength_ * static_cast<int64_t>(sizeof(T));
-        region = (region + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
-        int64_t regionS = currentBlockLength_ * scratchWidth;
-        regionS = (regionS + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
-        singleTileOffsetY_ = region / static_cast<int64_t>(sizeof(T));
-        singleTileOffsetS_ = (2 * region) / scratchWidth;
-        singleTileStrideS_ = regionS / scratchWidth;  // granule-aligned slot stride
-        pipe.InitBuffer(bufSingle, 2 * region + SCRATCH_COUNT * regionS);
-    } else {
-        pipe.InitBuffer(inputQueueX, BUFFER_NUM, tileBytesT);
-        pipe.InitBuffer(outputQueueY, BUFFER_NUM, tileBytesT);
-        pipe.InitBuffer(bufScratch, SCRATCH_COUNT * tileBytesS);
-    }
+    // round-8: no buffer allocation in Init. The single-tile path lays out
+    // x/y/e/p as raw UB regions starting at address 0 (no TPipe/InitBuffer at
+    // all); the multi-tile path allocates its queues + scratch in Process().
 
     inputGMX.SetGlobalBuffer((__gm__ T *)x + blockStart);
     outputGMY.SetGlobalBuffer((__gm__ T *)y + blockStart);
@@ -280,44 +268,62 @@ __aicore__ inline void Mish<T>::CopyInTile(int64_t tileIdx, int64_t tileElemNum)
     inputQueueX.EnQue(xLocal);
 }
 
-// Single-tile lightweight path: DataCopyPad in -> single MTE2->V event wait ->
-// compute (identical dtype-routed chain as the main pipeline) -> single V->MTE3
-// event wait -> DataCopyPad out. Event IDs come from the pipe allocator (no
-// queue initialized on this path, so no contention).
+// Single-tile TPipe-free path (round-8): raw UB layout at address 0
+//   native  : [x][y][e][p]          (regions 512B-aligned)
+//   bfloat16: [x][y][x32][e][p]     (scratch regions fp32-wide)
+// No TPipe constructor, no InitBuffer, no TBuf bookkeeping, no queue state
+// machine; fixed hardware event IDs (this path never touches the queue event
+// pool). InitSocState() is called explicitly: TPipe's constructor is what
+// normally performs it (set_atomic_none + set_mask_norm + vector-mask init).
 template <typename T>
 __aicore__ inline void Mish<T>::SingleTileProcess()
 {
     constexpr bool kIsHalf = MishIsHalf<T>();
     constexpr bool kIsFloat = (sizeof(T) == static_cast<size_t>(FLOAT_BYTES));
-    const int32_t count = static_cast<int32_t>(currentBlockLength_);
-    DataCopyExtParams copyParams{1, static_cast<uint32_t>(static_cast<int64_t>(count) * static_cast<int64_t>(sizeof(T))), 0, 0, 0};
-    DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
-    const int32_t evtMte2V = static_cast<int32_t>(pipe.FetchEventID(HardEvent::MTE2_V));
-    const int32_t evtVMte3 = static_cast<int32_t>(pipe.FetchEventID(HardEvent::V_MTE3));
-    auto xLocal = bufSingle.template Get<T>();
-    DataCopyPad(xLocal, inputGMX[0], copyParams, padParams);
-    SetFlag<HardEvent::MTE2_V>(evtMte2V);
-    WaitFlag<HardEvent::MTE2_V>(evtMte2V);
+    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
 
-    auto yLocal = bufSingle.template Get<T>()[static_cast<uint32_t>(singleTileOffsetY_)];
-    if constexpr (kIsFloat) {
-        MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
-            ScratchSlot<float>(1), ScratchSlot<float>(2),
-            yLocal.template ReinterpretCast<float>(), count);
-    } else if constexpr (kIsHalf) {
-        MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
-            ScratchSlot<half>(2), yLocal, count);
+    AscendC::InitSocState();  // TPipe normally does this in its constructor
+
+    const int64_t count64 = currentBlockLength_;
+    const int32_t count = static_cast<int32_t>(count64);
+    DataCopyExtParams copyParams{1, static_cast<uint32_t>(count64 * static_cast<int64_t>(sizeof(T))), 0, 0, 0};
+    DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+
+    // 512B-aligned region sizes: x/y are one T element per element; scratch
+    // uses the compute dtype (T for fp32/fp16, fp32 for bfloat16).
+    const int64_t region = AlignGranule(count64 * static_cast<int64_t>(sizeof(T)));
+    const int64_t regionS = AlignGranule(count64 * scratchWidth);
+    const uint32_t xAddr = 0;
+    const uint32_t yAddr = static_cast<uint32_t>(region);
+    const uint32_t sAddr = static_cast<uint32_t>(2 * region);
+
+    auto xT = LocalTensor<T>(TPosition::VECCALC, xAddr, RawTensorElems<T>(count));
+    auto yT = LocalTensor<T>(TPosition::VECCALC, yAddr, RawTensorElems<T>(count));
+    DataCopyPad(xT, inputGMX[0], copyParams, padParams);
+    SetFlag<HardEvent::MTE2_V>(event_t::EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(event_t::EVENT_ID0);
+
+    if constexpr (kIsFloat || kIsHalf) {
+        auto eT = LocalTensor<T>(TPosition::VECCALC, sAddr, RawTensorElems<T>(count));
+        auto pT = LocalTensor<T>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(region), RawTensorElems<T>(count));
+        MishE3Chain<T>(xT, eT, pT, yT, count);
     } else {
-        // bfloat16 -> fp32 compute -> round-to-nearest-even back
-        auto x32 = ScratchSlot<float>(0);
-        Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-        MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
-            ScratchSlot<float>(3), x32, count);
-        Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
+        // bfloat16 -> fp32 compute -> round-to-nearest-even back.
+        // x32 doubles as the chain output; e/p are fp32 scratch.
+        auto x32 = LocalTensor<float>(TPosition::VECCALC, sAddr, RawTensorElems<float>(count));
+        auto eT = LocalTensor<float>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(regionS), RawTensorElems<float>(count));
+        auto pT = LocalTensor<float>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(2 * regionS), RawTensorElems<float>(count));
+        Cast<float, T>(x32, xT, RoundMode::CAST_NONE, count);
+        MishE3Chain<float>(x32, eT, pT, x32, count);
+        Cast<T, float>(yT, x32, RoundMode::CAST_RINT, count);
     }
-    SetFlag<HardEvent::V_MTE3>(evtVMte3);
-    WaitFlag<HardEvent::V_MTE3>(evtVMte3);
-    DataCopyPad(outputGMY[0], yLocal, copyParams);
+
+    SetFlag<HardEvent::V_MTE3>(event_t::EVENT_ID1);
+    WaitFlag<HardEvent::V_MTE3>(event_t::EVENT_ID1);
+    DataCopyPad(outputGMY[0], yT, copyParams);
 }
 
 template <typename T>
@@ -329,9 +335,22 @@ __aicore__ inline void Mish<T>::Process()
         return;
     }
     if (singleTile_) {
-        SingleTileProcess();
+        SingleTileProcess();  // round-8: TPipe-free raw-UB path
         return;
     }
+
+    // round-8: the multi-tile path is the only TPipe user; construct the pipe
+    // here so single-tile launches never pay the constructor/pool-reset cost.
+    // Scratch count dropped by one: y (or x32 for bfloat16) doubles as q.
+    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
+    constexpr int64_t SCRATCH_COUNT = (kIsFloat || kIsHalf) ? 2 : 3;
+    const int64_t tileBytesT = elemPerTile_ * static_cast<int64_t>(sizeof(T));
+    const int64_t tileBytesS = elemPerTile_ * scratchWidth;
+    TPipe pipe;
+    pipe.InitBuffer(inputQueueX, BUFFER_NUM, tileBytesT);
+    pipe.InitBuffer(outputQueueY, BUFFER_NUM, tileBytesT);
+    pipe.InitBuffer(bufScratch, SCRATCH_COUNT * tileBytesS);
+
     // Prologue: issue tile 0 copy-in so the loop can prefetch tile i+1 before
     // consuming tile i.
     {
@@ -352,17 +371,14 @@ __aicore__ inline void Mish<T>::Process()
         auto yLocal = outputQueueY.AllocTensor<T>();
         if constexpr (kIsFloat) {
             MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
-                ScratchSlot<float>(1), ScratchSlot<float>(2),
-                yLocal.template ReinterpretCast<float>(), count);
+                ScratchSlot<float>(1), yLocal.template ReinterpretCast<float>(), count);
         } else if constexpr (kIsHalf) {
-            MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
-                ScratchSlot<half>(2), yLocal, count);
+            MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1), yLocal, count);
         } else {
             // bfloat16 -> fp32 compute -> round-to-nearest-even back
             auto x32 = ScratchSlot<float>(0);
             Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-            MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
-                ScratchSlot<float>(3), x32, count);
+            MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2), x32, count);
             Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
         }
         outputQueueY.EnQue<T>(yLocal);
@@ -397,8 +413,16 @@ std::tuple<int64_t, int64_t, int64_t, int64_t> calc_mish_tiling_params(
 {
     constexpr int64_t PIPELINE_DEPTH = 2;
     constexpr int64_t MIN_SPLIT_THRESHOLD = 4096;  // min elements per core (round-3: 1024 -> 4096)
-    constexpr int64_t SCRATCH_NATIVE = 3;          // native chain scratch count (e/p/q), width follows dtype
-    constexpr int64_t SCRATCH_BF16 = 4;            // bf16 Cast route scratch count (x32/e/p/q), fp32 width
+    // round-8: the kernel actually allocates only 2 native / 3 bf16 scratch
+    // (q is folded into y/x32), but the tile-size accounting deliberately
+    // keeps the round-7 granularity (3 native / 4 bf16 scratch equivalent).
+    // A/B on the mini case set (2026-11-12) showed that converting the freed
+    // UB into larger tiles regressed the medium multi-tile points by
+    // 1.0-3.4% (coarser double-buffer pipeline granularity), while small
+    // shapes were unchanged; the extra UB remains headroom. The constants
+    // derive from ubSize and dtype width only - no shape specialization.
+    constexpr int64_t SCRATCH_NATIVE = 3;          // tile-size accounting: round-7 native granularity
+    constexpr int64_t SCRATCH_BF16 = 4;            // tile-size accounting: round-7 bf16 granularity
     constexpr int64_t FLOAT_BYTES = 4;
     constexpr int64_t GRANULE_BYTES = 512;
 
@@ -408,13 +432,15 @@ std::tuple<int64_t, int64_t, int64_t, int64_t> calc_mish_tiling_params(
     int64_t coreNum = ascendcPlatform->GetCoreNumAiv();
     if (coreNum <= 0) coreNum = 1;
 
-    // Elements per tile from exact per-buffer accounting, routed by dtype
-    // identity (dtypeWidth alone cannot separate half from bfloat16):
-    //   float32:  3 fp32 scratch (e/p/q) -> 12 + 16 = 28 B/element -> 6912
-    //   float16:  native fp16 chain, 3 fp16 scratch -> 6 + 8 = 14 B/element -> 13824
-    //   bfloat16: Cast route, 4 fp32 scratch -> 16 + 8 = 24 B/element; the
-    //             exact value claims 100.0% of UB, so 512 elements (~12 KB)
+    // Elements per tile from the conservative round-7 accounting, routed by
+    // dtype identity (dtypeWidth alone cannot separate half from bfloat16):
+    //   float32:  3 fp32-equivalent scratch -> 12 + 16 = 28 B/element -> 6912
+    //   float16:  native fp16 chain, 3 fp16-equivalent scratch -> 6 + 8 = 14 B/element -> 13824
+    //   bfloat16: Cast route, 4 fp32-equivalent scratch -> 16 + 8 = 24 B/element;
+    //             the exact value claims 100.0% of UB, so 512 elements (~12 KB)
     //             are reserved for the system area
+    // The kernel allocates one scratch fewer than accounted (round-8 q fold);
+    // the difference is intentional headroom, see SCRATCH_NATIVE above.
     // Queue side costs PIPELINE_DEPTH * 2 (in/out) * dtypeWidth bytes/element.
     const bool nativeWidth = (dtypeWidth == FLOAT_BYTES) || (dtypeWidth == 2 && !isBfloat16);
     const int64_t scratchBytes = nativeWidth ? (SCRATCH_NATIVE * dtypeWidth) : (SCRATCH_BF16 * FLOAT_BYTES);

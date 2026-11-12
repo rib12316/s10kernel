@@ -105,11 +105,25 @@
  *     rank-0）逐例核验全过；阈值零改动，逐元素运算与 round-6 完全一致
  *     （均为执行结构变化）。
  *
- * 本文件为平台 GM-struct 形态：与直调最终版（workflow4 direct-invoke
- * mish_kernel.cpp，sha256 e6e477a8…）的类体逐行同源，仅 tiling 交付方式
- * 不同——平台版经 GET_TILING_DATA_WITH_STRUCT 从 GM 读 MishTilingData
- * 四字段（totalNum/blockFactor/ubFactor/granuleRem），直调版以同名标量
- * 参数传入；host 侧 tiling 计算与直调 calc_mish_tiling_params 一一对应。
+ * round-8（2026-11-12，直调工程真机 A/B 验证后移植）：
+ *   - E3 链 scratch 由 3 降为 2（e/p）：Div 直接写入输出 y（bfloat16 为
+ *     Cast 暂存 x32），q 被紧随的 y = q*p' 立即消费，省去独立 q 缓冲。
+ *     tiling 仍沿用 round-7 保守核算（fp32 28 / fp16 14 / bf16 24
+ *     B/元素，tileElems 6912/13824/7424 不变）：直调 mini case A/B
+ *     （2026-11-12）显示把省出的 UB 换成更大 tile 会使中等多 tile 点回退
+ *     1.0~3.4%（双缓冲流水粒度变粗），小 shape 无变化；差额作为 headroom。
+ *   - 单 tile 路径彻底去 TPipe：不构造 TPipe、不 InitBuffer；x/y/e/p 用
+ *     raw LocalTensor 直接布在 UB 地址 0 起的 512B 对齐区域，事件使用固定
+ *     EVENT_ID0/1。显式调用 InitSocState()——TPipe 构造器原本负责的
+ *     set_atomic_none / set_mask_norm / 向量 mask 初始化由此补上。
+ *   - 多 tile 路径保留 TPipe（Process 内局部构造）与双缓冲队列；scratch
+ *     槽位由 3/4 降为 2/3（native/bf16）。
+ *
+ * 本文件为平台 GM-struct 形态：与直调最终版（direct-invoke
+ * mish_kernel.cpp）的类体逐行同源，仅 tiling 交付方式不同——平台版经
+ * GET_TILING_DATA_WITH_STRUCT 从 GM 读 MishTilingData 四字段
+ * （totalNum/blockFactor/ubFactor/granuleRem），直调版以同名标量参数传入；
+ * host 侧 tiling 计算与直调 calc_mish_tiling_params 一一对应。
  */
 
 #ifndef MISH_H
@@ -135,8 +149,10 @@ constexpr float FLT_MAX_FINITE = 3.402823466e+38f;
 //   e = exp(x); a = e+2; p = e*a; p' = min(p, dtypeMax); w = p'+2; q = x/w; y = q*p'
 // 7 运算、单次 Div、全常量标量广播（无需常量向量与序言填充）。值域安全性
 // （+Inf/-Inf/NaN/±0/大正数 exp 溢出区/小负数次正规区）见文件头 round-4 注释。
-// 缓冲区角色：xT 只读输入；eT 演化 e->w；pT 演化 a->p'（钳位后）；qT 独立
-// Div 目的；y 接收结果。
+// round-8：仅 2 个 scratch（e/p）。Div 直接写入输出 y（q 被 y=q*p' 立即
+// 消费）；bfloat16 的 fp32 链输出为 Cast 暂存 x32，同一别名策略。缓冲区
+// 角色：xT 只读输入；eT 演化 e->w；pT 演化 a->p'（钳位后）；y 先接收 q、
+// 再接收最终结果。
 template <typename T>
 __aicore__ inline constexpr T MishDtypeMaxFin()
 {
@@ -149,7 +165,7 @@ __aicore__ inline constexpr T MishDtypeMaxFin()
 
 template <typename T>
 __aicore__ inline void MishE3Chain(const LocalTensor<T> xT, LocalTensor<T> eT,
-    LocalTensor<T> pT, LocalTensor<T> qT, LocalTensor<T> y, int32_t count)
+    LocalTensor<T> pT, LocalTensor<T> y, int32_t count)
 {
     constexpr T kDtypeMax = MishDtypeMaxFin<T>();
     Exp<T>(eT, xT, count);                              // e = exp(x)
@@ -157,8 +173,8 @@ __aicore__ inline void MishE3Chain(const LocalTensor<T> xT, LocalTensor<T> eT,
     Mul<T>(pT, eT, pT, count);                          // p = e(e+2)
     Mins<T>(pT, pT, kDtypeMax, count);                  // p' = min(p, dtype 最大有限值)
     Adds<T>(eT, pT, static_cast<T>(2.0), count);        // w = p' + 2（复用 eT）
-    Div<T>(qT, xT, eT, count);                          // q = x / w
-    Mul<T>(y, qT, pT, count);                           // y = q * p'
+    Div<T>(y, xT, eT, count);                           // q = x / w（y 兼作 q 槽位）
+    Mul<T>(y, y, pT, count);                            // y = q * p'
 }
 
 // dtype 路由（编译期，条件为 dtype 身份）
@@ -166,6 +182,21 @@ template <typename T>
 __aicore__ inline constexpr bool MishIsHalf()
 {
     return IsSameType<T, half>::value;
+}
+
+// round-8 单 tile raw 布局辅助：区域字节数按 512B MTE 粒度对齐；LocalTensor
+// 描述长度按 32B 对齐（raw 构造器要求字节长度 32B 对齐）。
+__aicore__ inline int64_t AlignGranule(int64_t bytes)
+{
+    return (bytes + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
+}
+
+template <typename T>
+__aicore__ inline uint32_t RawTensorElems(int32_t count)
+{
+    constexpr int64_t kElemBytes = static_cast<int64_t>(sizeof(T));
+    const int64_t bytes = (static_cast<int64_t>(count) * kElemBytes + 31) / 32 * 32;
+    return static_cast<uint32_t>(bytes / kElemBytes);
 }
 
 template <typename T>
@@ -180,25 +211,20 @@ private:
     __aicore__ inline void CopyInTile(int64_t tileIdx, int64_t tileElemNum);
     __aicore__ inline void SingleTileProcess();
     // round-7 方向③：共享 scratch TBuf 的元素偏移视图（槽位步长 = 计算 dtype
-    // 的一个 tile；单 tile 路径槽位在 bufSingle 内按 singleTileStrideS_ 偏移）
+    // 的一个 tile）。仅多 tile 路径使用；单 tile 路径（round-8）用 raw UB
+    // 地址直接构造 LocalTensor，不经过 TBuf。
     template <typename CT>
     __aicore__ inline AscendC::LocalTensor<CT> ScratchSlot(int32_t slot)
     {
-        if (singleTile_) {
-            return bufSingle.template Get<CT>()[static_cast<uint32_t>(singleTileOffsetS_ + slot * singleTileStrideS_)];
-        }
         return bufScratch.template Get<CT>()[static_cast<uint32_t>(slot) * static_cast<uint32_t>(elemPerTile_)];
     }
 
 private:
-    TPipe pipe;
+    // round-8：不再持有 TPipe。单 tile 路径完全 TPipe-free（raw UB 张量 +
+    // 固定事件 ID）；多 tile 路径在 Process() 内局部构造 TPipe 并分配。
     TQue<QuePosition::VECIN, BUFFER_NUM> inputQueueX;
     TQue<QuePosition::VECOUT, BUFFER_NUM> outputQueueY;
-    TBuf<TPosition::VECCALC> bufSingle;                 // round-7 D3b：单 tile 路径 x/y/scratch 单 TBuf 区域
-    TBuf<TPosition::VECCALC> bufScratch;                // round-7 D3：多 tile 路径 scratch 合一（1 次分配手工切片）
-    int64_t singleTileOffsetY_ = 0;                     // bufSingle 内 y 区域元素偏移
-    int64_t singleTileOffsetS_ = 0;                     // bufSingle 内 scratch 区域元素偏移
-    int64_t singleTileStrideS_ = 0;                     // scratch 槽位步长（CT 元素，512B 对齐）
+    TBuf<TPosition::VECCALC> bufScratch;                // 多 tile 路径 scratch 合一（1 次分配手工切片）
 
     GlobalTensor<T> inputGMX;
     GlobalTensor<T> outputGMY;
@@ -216,18 +242,10 @@ private:
 template <typename T>
 __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData* tilingData)
 {
-    constexpr bool kIsHalf = MishIsHalf<T>();
-    constexpr bool kIsFloat = (sizeof(T) == static_cast<size_t>(FLOAT_BYTES));
-    // scratch 宽度与数量按 dtype 路由：float 3×4B | half 3×2B | bfloat16 4×4B(x32)。
-    // 每 tile 元素数的 UB 精确核算在 host 侧 mish_tiling.cpp 完成，kernel 只消费结果。
-    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
-
     totalLength_ = tilingData->totalNum;
     // blockFactor 为 512B 粒度均匀基长（前 r 核各多 1 个 granule，r 在下方重组）
     blockLength_ = tilingData->blockFactor;
     elemPerTile_ = tilingData->ubFactor;
-    const int64_t tileBytesT = elemPerTile_ * static_cast<int64_t>(sizeof(T));
-    const int64_t tileBytesS = elemPerTile_ * scratchWidth;
 
     // 每核范围：512B granule base+r 划分（round-5：r 由 host 经 tiling 字段直接
     // 下发，恒满足 0 <= r < numBlocks，免去除法与 GetBlockNum 依赖）。
@@ -262,30 +280,9 @@ __aicore__ inline void Mish<T>::Init(GM_ADDR x, GM_ADDR y, const MishTilingData*
         tiles_ = 0;  // 空张量守卫（tiles==0 时 Process 直接返回）
     }
 
-    // round-7 方向③：e/p/q 演化暂存（bfloat16 另含 x32）共用一次 TBuf 分配，
-    // 链内按下方元素偏移切片访问。单 tile 路径见 D3b，多 tile 路径 InitBuffer
-    // 次数由 5~6 降为 3（队列×2 + scratch×1），每次启动少一轮 TPipe 簿记。
-    constexpr int64_t SCRATCH_COUNT = (kIsFloat || kIsHalf) ? 3 : 4;
-    if (singleTile_) {
-        // round-7 D3b：时延关键的单 tile 路径上 x/y/scratch 区域并入单个 TBuf，
-        // 且按实际核内长度（各区域 512B 向上取整对齐，故所有切片保持 granule
-        // 对齐）而非满 tile 尺寸分配。基线版本为 1024 元素负载按满 tile 分配
-        // ~138 KiB/核；按实际长度分配消除了差值，并把该路径收敛到恰好 1 次
-        // InitBuffer。region/regionS 偏移与槽位步长均为整除关系，分配总量
-        // 2*region + SCRATCH_COUNT*regionS 覆盖全部切片（布局检视见移植记录）。
-        int64_t region = currentBlockLength_ * static_cast<int64_t>(sizeof(T));
-        region = (region + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
-        int64_t regionS = currentBlockLength_ * scratchWidth;
-        regionS = (regionS + GRANULE_BYTES - 1) / GRANULE_BYTES * GRANULE_BYTES;
-        singleTileOffsetY_ = region / static_cast<int64_t>(sizeof(T));
-        singleTileOffsetS_ = (2 * region) / scratchWidth;
-        singleTileStrideS_ = regionS / scratchWidth;  // 512B 对齐的槽位步长
-        pipe.InitBuffer(bufSingle, 2 * region + SCRATCH_COUNT * regionS);
-    } else {
-        pipe.InitBuffer(inputQueueX, BUFFER_NUM, tileBytesT);
-        pipe.InitBuffer(outputQueueY, BUFFER_NUM, tileBytesT);
-        pipe.InitBuffer(bufScratch, SCRATCH_COUNT * tileBytesS);
-    }
+    // round-8：Init 不再做任何 UB 分配。单 tile 路径在 SingleTileProcess
+    // 内用 raw 地址布局（完全无 TPipe/InitBuffer）；多 tile 路径在 Process
+    // 内局部构造 TPipe 后分配队列与 scratch。
 
     inputGMX.SetGlobalBuffer((__gm__ T *)x + blockStart);
     outputGMY.SetGlobalBuffer((__gm__ T *)y + blockStart);
@@ -302,43 +299,61 @@ __aicore__ inline void Mish<T>::CopyInTile(int64_t tileIdx, int64_t tileElemNum)
     inputQueueX.EnQue(xLocal);
 }
 
-// 单 tile 轻量路径：DataCopyPad 拷入 -> 单次 MTE2->V 事件等待 -> 计算
-// （与主流水线完全一致的 dtype 路由计算链）-> 单次 V->MTE3 事件等待 ->
-// DataCopyPad 拷出。事件 ID 来自 pipe 分配器（该路径未初始化队列，无争用）。
+// 单 tile TPipe-free 路径（round-8）：raw UB 布局自地址 0 起
+//   native  : [x][y][e][p]          （区域 512B 对齐）
+//   bfloat16: [x][y][x32][e][p]     （scratch 区域 fp32 宽度）
+// 不构造 TPipe、不 InitBuffer、无 TBuf 簿记、无队列状态机；事件用固定硬件
+// ID（本路径不接触队列事件池）。显式调用 InitSocState()——TPipe 构造器原本
+// 负责的 set_atomic_none / set_mask_norm / 向量 mask 初始化由此补上。
 template <typename T>
 __aicore__ inline void Mish<T>::SingleTileProcess()
 {
     constexpr bool kIsHalf = MishIsHalf<T>();
     constexpr bool kIsFloat = (sizeof(T) == static_cast<size_t>(FLOAT_BYTES));
-    const int32_t count = static_cast<int32_t>(currentBlockLength_);
-    DataCopyExtParams copyParams{1, static_cast<uint32_t>(static_cast<int64_t>(count) * static_cast<int64_t>(sizeof(T))), 0, 0, 0};
-    DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
-    const int32_t evtMte2V = static_cast<int32_t>(pipe.FetchEventID(HardEvent::MTE2_V));
-    const int32_t evtVMte3 = static_cast<int32_t>(pipe.FetchEventID(HardEvent::V_MTE3));
-    auto xLocal = bufSingle.template Get<T>();
-    DataCopyPad(xLocal, inputGMX[0], copyParams, padParams);
-    SetFlag<HardEvent::MTE2_V>(evtMte2V);
-    WaitFlag<HardEvent::MTE2_V>(evtMte2V);
+    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
 
-    auto yLocal = bufSingle.template Get<T>()[static_cast<uint32_t>(singleTileOffsetY_)];
-    if constexpr (kIsFloat) {
-        MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
-            ScratchSlot<float>(1), ScratchSlot<float>(2),
-            yLocal.template ReinterpretCast<float>(), count);
-    } else if constexpr (kIsHalf) {
-        MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
-            ScratchSlot<half>(2), yLocal, count);
+    AscendC::InitSocState();  // TPipe 构造器原本在这里执行该初始化
+
+    const int64_t count64 = currentBlockLength_;
+    const int32_t count = static_cast<int32_t>(count64);
+    DataCopyExtParams copyParams{1, static_cast<uint32_t>(count64 * static_cast<int64_t>(sizeof(T))), 0, 0, 0};
+    DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+
+    // 区域字节数 512B 对齐；scratch 使用计算 dtype 宽度（native 为 T，
+    // bfloat16 为 fp32）。
+    const int64_t region = AlignGranule(count64 * static_cast<int64_t>(sizeof(T)));
+    const int64_t regionS = AlignGranule(count64 * scratchWidth);
+    const uint32_t xAddr = 0;
+    const uint32_t yAddr = static_cast<uint32_t>(region);
+    const uint32_t sAddr = static_cast<uint32_t>(2 * region);
+
+    auto xT = LocalTensor<T>(TPosition::VECCALC, xAddr, RawTensorElems<T>(count));
+    auto yT = LocalTensor<T>(TPosition::VECCALC, yAddr, RawTensorElems<T>(count));
+    DataCopyPad(xT, inputGMX[0], copyParams, padParams);
+    SetFlag<HardEvent::MTE2_V>(event_t::EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(event_t::EVENT_ID0);
+
+    if constexpr (kIsFloat || kIsHalf) {
+        auto eT = LocalTensor<T>(TPosition::VECCALC, sAddr, RawTensorElems<T>(count));
+        auto pT = LocalTensor<T>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(region), RawTensorElems<T>(count));
+        MishE3Chain<T>(xT, eT, pT, yT, count);
     } else {
-        // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
-        auto x32 = ScratchSlot<float>(0);
-        Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-        MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
-            ScratchSlot<float>(3), x32, count);
-        Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
+        // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回。
+        // x32 兼作链输出；e/p 为 fp32 scratch。
+        auto x32 = LocalTensor<float>(TPosition::VECCALC, sAddr, RawTensorElems<float>(count));
+        auto eT = LocalTensor<float>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(regionS), RawTensorElems<float>(count));
+        auto pT = LocalTensor<float>(TPosition::VECCALC,
+            sAddr + static_cast<uint32_t>(2 * regionS), RawTensorElems<float>(count));
+        Cast<float, T>(x32, xT, RoundMode::CAST_NONE, count);
+        MishE3Chain<float>(x32, eT, pT, x32, count);
+        Cast<T, float>(yT, x32, RoundMode::CAST_RINT, count);
     }
-    SetFlag<HardEvent::V_MTE3>(evtVMte3);
-    WaitFlag<HardEvent::V_MTE3>(evtVMte3);
-    DataCopyPad(outputGMY[0], yLocal, copyParams);
+
+    SetFlag<HardEvent::V_MTE3>(event_t::EVENT_ID1);
+    WaitFlag<HardEvent::V_MTE3>(event_t::EVENT_ID1);
+    DataCopyPad(outputGMY[0], yT, copyParams);
 }
 
 template <typename T>
@@ -350,9 +365,21 @@ __aicore__ inline void Mish<T>::Process()
         return;
     }
     if (singleTile_) {
-        SingleTileProcess();
+        SingleTileProcess();  // round-8：TPipe-free raw UB 路径
         return;
     }
+
+    // round-8：多 tile 路径是唯一使用 TPipe 的路径；在此局部构造，单 tile
+    // 启动不付构造器/pool reset 成本。scratch 槽位再降 1（y/x32 兼作 q）。
+    constexpr int64_t scratchWidth = kIsFloat ? FLOAT_BYTES : (kIsHalf ? 2 : FLOAT_BYTES);
+    constexpr int64_t SCRATCH_COUNT = (kIsFloat || kIsHalf) ? 2 : 3;
+    const int64_t tileBytesT = elemPerTile_ * static_cast<int64_t>(sizeof(T));
+    const int64_t tileBytesS = elemPerTile_ * scratchWidth;
+    TPipe pipe;
+    pipe.InitBuffer(inputQueueX, BUFFER_NUM, tileBytesT);
+    pipe.InitBuffer(outputQueueY, BUFFER_NUM, tileBytesT);
+    pipe.InitBuffer(bufScratch, SCRATCH_COUNT * tileBytesS);
+
     // 序言：先发出 tile 0 的拷入，使循环内在消费 tile i 之前预取 tile i+1
     {
         const int64_t firstN = (tileNum_ > 0) ? elemPerTile_ : tailTileElementNum_;
@@ -371,17 +398,14 @@ __aicore__ inline void Mish<T>::Process()
         auto yLocal = outputQueueY.AllocTensor<T>();
         if constexpr (kIsFloat) {
             MishE3Chain<float>(xLocal.template ReinterpretCast<float>(), ScratchSlot<float>(0),
-                ScratchSlot<float>(1), ScratchSlot<float>(2),
-                yLocal.template ReinterpretCast<float>(), count);
+                ScratchSlot<float>(1), yLocal.template ReinterpretCast<float>(), count);
         } else if constexpr (kIsHalf) {
-            MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1),
-                ScratchSlot<half>(2), yLocal, count);
+            MishE3Chain<half>(xLocal, ScratchSlot<half>(0), ScratchSlot<half>(1), yLocal, count);
         } else {
             // bfloat16 -> fp32 计算 -> round-to-nearest-even 转回
             auto x32 = ScratchSlot<float>(0);
             Cast<float, T>(x32, xLocal, RoundMode::CAST_NONE, count);
-            MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2),
-                ScratchSlot<float>(3), x32, count);
+            MishE3Chain<float>(x32, ScratchSlot<float>(1), ScratchSlot<float>(2), x32, count);
             Cast<T, float>(yLocal, x32, RoundMode::CAST_RINT, count);
         }
         outputQueueY.EnQue<T>(yLocal);
